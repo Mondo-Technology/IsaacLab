@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import omni.log
 import omni.physics.tensors.impl.api as physx
 import warp as wp
+import isaacsim.core.utils.prims as prim_utils
 from isaacsim.core.prims import XFormPrim
 from isaacsim.core.simulation_manager import SimulationManager
 from pxr import UsdGeom, UsdPhysics
@@ -684,7 +685,20 @@ class RayCaster(SensorBase):
                         omni.log.warn(f"Failed to create trimesh for {geom_type}: {geom_prim.GetPath()}")
                         return None
                     
-                    # Apply world transformation
+                    # Get scale from USD prim attribute
+                    try:
+                        path = geom_prim.GetPath().pathString
+                        prim = prim_utils.get_prim_at_path(path)
+                        scale_attr = prim.GetAttribute("xformOp:scale")
+                        if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                            scale = tuple(scale_attr.Get())
+                            # Apply scale to trimesh object if scale is not uniform [1,1,1]
+                            if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                                trimesh_mesh.apply_scale(scale)
+                    except Exception as e:
+                        omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+                    
+                    # Apply world transformation (rotation and translation)
                     try:
                         xform = UsdGeom.Xformable(geom_prim)
                         if xform:
@@ -755,6 +769,21 @@ class RayCaster(SensorBase):
             if geom_type == "Plane":
                 # Create a simple plane in local coordinates
                 plane_mesh = make_plane(size=(2e6, 2e6), height=0.0, center_zero=True)
+                
+                # Apply scale if present in the USD prim attribute
+                try:
+                    path = geom_prim.GetPath().pathString
+                    prim = prim_utils.get_prim_at_path(path)
+                    scale_attr = prim.GetAttribute("xformOp:scale")
+                    if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                        scale = tuple(scale_attr.Get())
+                        # Apply scale to plane vertices if scale is not uniform [1,1,1]
+                        if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                            vertices_scaled = plane_mesh.vertices * np.array(scale)
+                            return vertices_scaled, plane_mesh.faces.flatten()
+                except Exception as e:
+                    omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+                
                 return plane_mesh.vertices, plane_mesh.faces.flatten()
                 
             elif geom_type == "Mesh":
@@ -785,12 +814,39 @@ class RayCaster(SensorBase):
                 if not all(count == 3 for count in face_counts):
                     faces = self._triangulate_faces_from_list_dynamic(faces, face_counts)
                 
+                # Apply scale if present in the USD prim attribute
+                try:
+                    path = geom_prim.GetPath().pathString
+                    prim = prim_utils.get_prim_at_path(path)
+                    scale_attr = prim.GetAttribute("xformOp:scale")
+                    if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                        scale = tuple(scale_attr.Get())
+                        # Apply scale to mesh vertices if scale is not uniform [1,1,1]
+                        if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                            points_scaled = points * np.array(scale)
+                            return points_scaled, np.array(faces)
+                except Exception as e:
+                    omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+                
                 return points, np.array(faces)
                 
             else:
-                # Handle primitive shapes using trimesh in local coordinates
+                # Handle primitive shapes using trimesh in local coordinates with scale applied
                 trimesh_mesh = self._create_trimesh_from_usd_primitive_dynamic(geom_prim, geom_type)
                 if trimesh_mesh is not None:
+                    # Get scale from USD prim attribute
+                    try:
+                        path = geom_prim.GetPath().pathString
+                        prim = prim_utils.get_prim_at_path(path)
+                        scale_attr = prim.GetAttribute("xformOp:scale")
+                        if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                            scale = tuple(scale_attr.Get())
+                            # Apply scale to trimesh object if scale is not uniform [1,1,1]
+                            if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                                trimesh_mesh.apply_scale(scale)
+                    except Exception as e:
+                        omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+                    
                     return trimesh_mesh.vertices, trimesh_mesh.faces.flatten()
                     
         except Exception as e:
