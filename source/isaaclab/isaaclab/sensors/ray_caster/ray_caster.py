@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 import re
 import torch
+import trimesh
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -72,6 +73,12 @@ class RayCaster(SensorBase):
         self._data = RayCasterData()
         # the warp meshes used for raycasting.
         self.meshes: dict[str, wp.Mesh] = {}
+        # Dynamic mesh support - additional variables for efficient updates
+        self.combined_mesh: wp.Mesh | None = None
+        self.all_mesh_view: XFormPrim | None = None
+        self.all_base_points: torch.Tensor | None = None
+        self.vertex_counts_per_instance: torch.Tensor | None = None
+        self.mesh_instance_indices: torch.Tensor | None = None
 
     def __str__(self) -> str:
         """Returns: A string containing information about the instance."""
@@ -153,7 +160,7 @@ class RayCaster(SensorBase):
             raise RuntimeError(f"Failed to find a valid prim view class for the prim paths: {self.cfg.prim_path}")
 
         # load the meshes by parsing the stage
-        self._initialize_warp_meshes()
+        self._initialize_enhanced_warp_meshes()
         # initialize the ray start and directions
         self._initialize_rays_impl()
 
@@ -241,6 +248,108 @@ class RayCaster(SensorBase):
             wp_mesh = convert_to_warp_mesh(plane_mesh.vertices, plane_mesh.faces, device=self.device)
             self.meshes["default_ground"] = wp_mesh
 
+    def _initialize_enhanced_warp_meshes(self):
+        """Enhanced mesh initialization that supports dynamic meshes.
+        
+        This method first calls the original mesh initialization, then sets up
+        the dynamic mesh tracking system if dynamic mesh support is needed.
+        """
+        # First call the original method to maintain all existing functionality
+        self._initialize_warp_meshes()
+        
+        # Now add dynamic mesh support if meshes were found
+        if len(self.meshes) > 0:
+            self._setup_dynamic_mesh_system()
+    
+    def _setup_dynamic_mesh_system(self):
+        """Set up the dynamic mesh tracking system for efficient updates."""
+        # Data structures for efficient mesh combination
+        all_mesh_prim_paths = []
+        combined_points = []
+        combined_indices = []
+        vertex_counts = []
+        vertex_offset = 0
+        total_meshes_found = 0
+        
+        # Define supported geometry types
+        supported_geometry_types = ["Mesh", "Plane", "Sphere", "Cube", "Cylinder", "Capsule", "Cone"]
+        
+        omni.log.info("Setting up dynamic mesh system for ray caster...")
+        
+        # Process each mesh path to extract geometry data for dynamic tracking
+        for mesh_prim_path in self.cfg.mesh_prim_paths:
+            # Check if the prim path exists before processing
+            if not sim_utils.find_first_matching_prim(mesh_prim_path):
+                continue
+            
+            # Find all supported geometry prims under this path
+            all_geometry_prims = []
+            for geom_type in supported_geometry_types:
+                prims = sim_utils.get_all_matching_child_prims(
+                    mesh_prim_path, 
+                    lambda prim, gt=geom_type: prim.GetTypeName() == gt
+                )
+                all_geometry_prims.extend(prims)
+
+            # If no geometry prims found directly, try to find exact match
+            if len(all_geometry_prims) == 0:
+                exact_prim = sim_utils.find_first_matching_prim(mesh_prim_path)
+                if exact_prim and exact_prim.IsValid() and exact_prim.GetTypeName() in supported_geometry_types:
+                    all_geometry_prims = [exact_prim]
+            
+            # Process all found geometry prims
+            for geom_prim in all_geometry_prims:
+                mesh_data = self._extract_mesh_data_from_prim_dynamic(geom_prim)
+                if mesh_data is not None:
+                    points, indices = mesh_data
+                    
+                    # Add vertex offset to indices for combining meshes
+                    offset_indices = indices + vertex_offset
+                    
+                    # Add to combined arrays
+                    combined_points.append(points)
+                    combined_indices.append(offset_indices)
+                    vertex_counts.append(len(points))
+                    vertex_offset += len(points)
+                    total_meshes_found += 1
+                    
+                    # Store prim path for XFormPrim view creation
+                    all_mesh_prim_paths.append(geom_prim.GetPath().pathString)
+        
+        # Create the dynamic mesh system if we found meshes
+        if total_meshes_found > 0:
+            try:
+                # Combine all points and indices
+                final_points = np.vstack(combined_points)
+                final_indices = np.concatenate(combined_indices)
+                
+                # Create single warp mesh from combined data
+                self.combined_mesh = convert_to_warp_mesh(final_points, final_indices, device=self.device)
+                
+                # Create single XFormPrim view for all meshes
+                self.all_mesh_view = XFormPrim(all_mesh_prim_paths, reset_xform_properties=False)
+                
+                # Setup efficient vectorized update system
+                self.all_base_points = torch.tensor(final_points, device=self.device, dtype=torch.float32)
+                self.vertex_counts_per_instance = torch.tensor(vertex_counts, device=self.device, dtype=torch.int32)
+                
+                # Create mesh instance indices for mapping
+                self.mesh_instance_indices = torch.arange(total_meshes_found, device=self.device, dtype=torch.int32)
+                
+                omni.log.info(f"Successfully set up dynamic mesh system:")
+                omni.log.info(f"  - Tracking {total_meshes_found} mesh instances")
+                omni.log.info(f"  - Total vertices: {len(final_points)}")
+                omni.log.info(f"  - Total faces: {len(final_indices) // 3}")
+                
+            except Exception as e:
+                omni.log.warn(f"Failed to setup dynamic mesh system: {str(e)}")
+                # Reset dynamic mesh variables on failure
+                self.combined_mesh = None
+                self.all_mesh_view = None
+                self.all_base_points = None
+                self.vertex_counts_per_instance = None
+                self.mesh_instance_indices = None
+
     def _initialize_rays_impl(self):
         # compute ray stars and directions
         self.ray_starts, self.ray_directions = self.cfg.pattern_cfg.func(self.cfg.pattern_cfg, self._device)
@@ -283,6 +392,10 @@ class RayCaster(SensorBase):
         self._data.pos_w[env_ids] = pos_w
         self._data.quat_w[env_ids] = quat_w
 
+        # Update dynamic meshes if available
+        if self.combined_mesh is not None:
+            self._update_combined_mesh_efficiently()
+
         # ray cast based on the sensor poses
         if self.cfg.ray_alignment == "world":
             # apply horizontal drift to ray starting position in ray caster frame
@@ -316,12 +429,17 @@ class RayCaster(SensorBase):
             raise RuntimeError(f"Unsupported ray_alignment type: {self.cfg.ray_alignment}.")
 
         # ray cast and store the hits
-        # TODO: Make this work for multiple meshes?
+        # Use combined mesh if available for dynamic support, otherwise use original mesh
+        if self.combined_mesh is not None:
+            mesh_to_use = self.combined_mesh
+        else:
+            mesh_to_use = self.meshes[self.cfg.mesh_prim_paths[0]]
+            
         self._data.ray_hits_w[env_ids] = raycast_mesh(
             ray_starts_w,
             ray_directions_w,
             max_dist=self.cfg.max_distance,
-            mesh=self.meshes[self.cfg.mesh_prim_paths[0]],
+            mesh=mesh_to_use,
         )[0]
 
         # apply vertical drift to ray starting position in ray caster frame
@@ -356,6 +474,8 @@ class RayCaster(SensorBase):
         super()._invalidate_initialize_callback(event)
         # set all existing views to None to invalidate them
         self._view = None
+        # Invalidate dynamic mesh view as well
+        self.all_mesh_view = None
 
     def _create_trimesh_from_usd_primitive(self, geom_prim, geom_type):
         """Create a trimesh object from USD primitive parameters.
@@ -618,3 +738,164 @@ class RayCaster(SensorBase):
             face_idx += count
         
         return triangulated_faces
+
+    def _extract_mesh_data_from_prim_dynamic(self, geom_prim):
+        """Extract mesh data from USD geometry primitive for dynamic tracking.
+        
+        Args:
+            geom_prim: USD geometry primitive
+            
+        Returns:
+            tuple: (points, indices) as numpy arrays in local coordinates, or None if extraction failed
+        """
+        from pxr import UsdGeom
+        try:
+            geom_type = geom_prim.GetTypeName()
+
+            if geom_type == "Plane":
+                # Create a simple plane in local coordinates
+                plane_mesh = make_plane(size=(2e6, 2e6), height=0.0, center_zero=True)
+                return plane_mesh.vertices, plane_mesh.faces.flatten()
+                
+            elif geom_type == "Mesh":
+                # Direct mesh access
+                mesh_geom = UsdGeom.Mesh(geom_prim)
+                points_attr = mesh_geom.GetPointsAttr()
+                face_indices_attr = mesh_geom.GetFaceVertexIndicesAttr()
+                face_counts_attr = mesh_geom.GetFaceVertexCountsAttr()
+                
+                if not (points_attr and face_indices_attr and face_counts_attr):
+                    return None
+                    
+                points_data = points_attr.Get()
+                faces_data = face_indices_attr.Get()
+                face_counts_data = face_counts_attr.Get()
+                
+                if points_data is None or faces_data is None or face_counts_data is None:
+                    return None
+                
+                points = np.array([[x[0], x[1], x[2]] for x in points_data])
+                faces = list(faces_data)
+                face_counts = list(face_counts_data)
+                
+                if len(points) == 0 or len(faces) == 0:
+                    return None
+                
+                # Triangulate if needed
+                if not all(count == 3 for count in face_counts):
+                    faces = self._triangulate_faces_from_list_dynamic(faces, face_counts)
+                
+                return points, np.array(faces)
+                
+            else:
+                # Handle primitive shapes using trimesh in local coordinates
+                trimesh_mesh = self._create_trimesh_from_usd_primitive_dynamic(geom_prim, geom_type)
+                if trimesh_mesh is not None:
+                    return trimesh_mesh.vertices, trimesh_mesh.faces.flatten()
+                    
+        except Exception as e:
+            omni.log.warn(f"Failed to extract dynamic mesh data from {geom_prim.GetTypeName()} {geom_prim.GetPath()}: {str(e)}")
+            return None
+
+    def _create_trimesh_from_usd_primitive_dynamic(self, geom_prim, geom_type):
+        """Create a trimesh object from USD primitive parameters in local coordinates.
+        
+        Args:
+            geom_prim: USD geometry primitive 
+            geom_type: Type of the primitive
+            
+        Returns:
+            trimesh.Trimesh object or None if creation failed
+        """
+        try:
+            from pxr import UsdGeom
+            
+            if geom_type == "Sphere":
+                sphere_geom = UsdGeom.Sphere(geom_prim)
+                radius_attr = sphere_geom.GetRadiusAttr()
+                radius = radius_attr.Get() if radius_attr else 1.0
+                return trimesh.creation.uv_sphere(radius=radius)
+                
+            elif geom_type == "Cube":
+                cube_geom = UsdGeom.Cube(geom_prim)
+                size_attr = cube_geom.GetSizeAttr()
+                size = size_attr.Get() if size_attr else 2.0
+                return trimesh.creation.box(extents=[size, size, size])
+                
+            elif geom_type == "Cylinder":
+                cylinder_geom = UsdGeom.Cylinder(geom_prim)
+                radius_attr = cylinder_geom.GetRadiusAttr()
+                height_attr = cylinder_geom.GetHeightAttr()
+                radius = radius_attr.Get() if radius_attr else 1.0
+                height = height_attr.Get() if height_attr else 2.0
+                return trimesh.creation.cylinder(radius=radius, height=height)
+                
+            else:
+                return None
+                
+        except Exception as e:
+            omni.log.warn(f"Failed to create dynamic trimesh for {geom_type}: {str(e)}")
+            return None
+
+    def _triangulate_faces_from_list_dynamic(self, faces: list, face_counts: list) -> list:
+        """Convert polygonal faces to triangles for dynamic meshes."""
+        triangulated_faces = []
+        face_idx = 0
+        
+        for count in face_counts:
+            if count == 3:
+                triangulated_faces.extend(faces[face_idx:face_idx + 3])
+            elif count == 4:
+                v0, v1, v2, v3 = faces[face_idx:face_idx + 4]
+                triangulated_faces.extend([v0, v1, v2, v0, v2, v3])
+            else:
+                # Fan triangulation for polygons
+                for i in range(1, count - 1):
+                    triangulated_faces.extend([faces[face_idx], faces[face_idx + i], faces[face_idx + i + 1]])
+            face_idx += count
+        
+        return triangulated_faces
+
+    def _update_combined_mesh_efficiently(self):
+        """Efficiently update the combined mesh using vectorized operations."""
+        if (self.all_mesh_view is None or self.combined_mesh is None or 
+            self.mesh_instance_indices is None or self.vertex_counts_per_instance is None or
+            self.all_base_points is None):
+            return
+            
+        try:
+            # Get current world poses for all mesh instances
+            num_mesh_instances = len(self.mesh_instance_indices)
+            current_poses, current_quats = self.all_mesh_view.get_world_poses(
+                torch.arange(num_mesh_instances, device=self.device)
+            )
+            
+            # Convert to torch tensors if needed
+            if isinstance(current_poses, np.ndarray):
+                current_poses = torch.from_numpy(current_poses).to(device=self.device)
+            if isinstance(current_quats, np.ndarray):
+                current_quats = torch.from_numpy(current_quats).to(device=self.device)
+            
+            # Expand current poses and quats to vertex level
+            expanded_positions = torch.repeat_interleave(
+                current_poses, 
+                self.vertex_counts_per_instance.long(), 
+                dim=0
+            )
+            
+            expanded_quats = torch.repeat_interleave(
+                current_quats,
+                self.vertex_counts_per_instance.long(), 
+                dim=0
+            )
+            
+            # Apply world transform: quat_apply(mesh_quat, base_points) + mesh_pos
+            transformed_points = quat_apply(expanded_quats, self.all_base_points) + expanded_positions
+            
+            # Update the warp mesh with the new transformed points
+            updated_points_wp = wp.from_torch(transformed_points, dtype=wp.vec3)
+            self.combined_mesh.points = updated_points_wp
+            self.combined_mesh.refit()
+            
+        except Exception as e:
+            omni.log.warn(f"Failed to update combined mesh efficiently: {str(e)}")
