@@ -26,7 +26,7 @@ from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Tutorial on creating a quadruped base environment with LiDAR.")
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
+parser.add_argument("--num_envs", type=int, default=4, help="Number of environments to spawn.")
 parser.add_argument("--enable_lidar", type=bool, default=False ,help="Enable LiDAR sensor for benchmarking.")
 parser.add_argument("--benchmark_steps", type=int, default=1000, help="Number of steps to run for benchmarking.")
 
@@ -46,7 +46,7 @@ import time
 
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg,RigidObjectCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg, RandomAssetCfg, RandomAssetsImporterCfg
 #, RandomAssetCfg, RandomAssetsImporterCfg,
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -87,26 +87,26 @@ class MySceneCfg(InteractiveSceneCfg):
     """Example scene configuration."""
 
     # add terrain
-    terrain = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="generator",
-        terrain_generator=ROUGH_TERRAINS_CFG,
-        max_init_terrain_level=5,
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
-            static_friction=1.0,
-            dynamic_friction=1.0,
-        ),
-        debug_vis=False,
-    )
-    #terrain = TerrainImporterCfg(prim_path="/World/ground", terrain_type="plane", debug_vis=False)
+    # terrain = TerrainImporterCfg(
+    #     prim_path="/World/ground",
+    #     terrain_type="generator",
+    #     terrain_generator=ROUGH_TERRAINS_CFG,
+    #     max_init_terrain_level=5,
+    #     collision_group=-1,
+    #     physics_material=sim_utils.RigidBodyMaterialCfg(
+    #         friction_combine_mode="multiply",
+    #         restitution_combine_mode="multiply",
+    #         static_friction=1.0,
+    #         dynamic_friction=1.0,
+    #     ),
+    #     debug_vis=False,
+    # )
+    terrain = TerrainImporterCfg(prim_path="/World/ground", terrain_type="plane", debug_vis=False)
     robot: ArticulationCfg = ANYMAL_C_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0), rot=(1, 0, 0., 0.)),
-        attach_yaw_only=True,
+        ray_alignment='yaw',
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
@@ -114,10 +114,9 @@ class MySceneCfg(InteractiveSceneCfg):
     height_scanner_vis = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0), rot=(1, 0, 0., 0.)),
-        attach_yaw_only=False,
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[10., 10.0]),
         debug_vis=True,
-        mesh_prim_paths=["/World/ground","/World/stairs", "/World/slopes","/World/ball","/World/cube","/World/static"],
+        mesh_prim_paths=["/World/ground", "/World/random_blocks", "/World/random_instances", "/World/static","/World/slopes"],
     )
     #mesh_prim_paths=["/World/ground", "/World/envs/env_.*/stairs/.*", "/World/envs/env_.*/human/.*", "/World/envs/env_.*/cones/.*"],
     # Conditionally add LiDAR sensor based on args
@@ -147,60 +146,79 @@ class MySceneCfg(InteractiveSceneCfg):
         prim_path="/World/light",
         spawn=sim_utils.DistantLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
-    cfg_1 = RigidObjectCfg(
-        prim_path="/World/static/cube",
-        spawn=sim_utils.CuboidCfg(
-            size=(0.3, 0.3, 0.3),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.6, 3.0),rot=(0.924,0.383,0,0))
+    random_assets = RandomAssetsImporterCfg(
+        assets={
+            "cubes": RandomAssetCfg(
+                rigid_object_cfg=RigidObjectCfg(
+                    prim_path="/World/static/Cubes/Cube_*",
+                    spawn=sim_utils.CuboidCfg(
+                        size=(0.2, 0.2, 1),
+                        rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
+                        mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                        collision_props=sim_utils.CollisionPropertiesCfg(),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0), metallic=0.2),
+                    ),
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
+                ),
+                proportion=1.0,
+                pos_range_x=(-10.0, 10.0),
+                pos_range_y=(-10.0, 10.0),
+                pos_range_z=(0.5, 0.5),
+                rot_range_z=(0.0, 6.28318),
+                rot_range_y = (0.0, 0.0),  
+                rot_range_x = (0.0, 0.0),  
+                prim_path_template="/World/static/Cubes/Cube_{ASSET_INDEX}",
+                enable_velocity_control=True,
+                linear_velocity_range=((-2, 2), (-1, 1), (-0., 0.)),
+                angular_velocity_range=((-1, 1), (-1, 1), (-1, 1)),
+                velocity_update_frequency=0.5,  # Update velocities every 2 seconds
+            ),
+            "spheres": RandomAssetCfg(
+                rigid_object_cfg=RigidObjectCfg(
+                    prim_path="/World/static/Spheres/Sphere_*",
+                    spawn=sim_utils.SphereCfg(
+                        radius=0.1,
+                        rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
+                        mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+                        collision_props=sim_utils.CollisionPropertiesCfg(),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
+                    ),
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
+                ),
+                proportion=0.0,
+                pos_range_x=(-50.0, 50.0),
+                pos_range_y=(-50.0, 50.0),
+                pos_range_z=(0.5, 2.0),
+                rot_range_z=(0.0, 6.28318),
+                prim_path_template="/World/static/Spheres/Sphere_{ASSET_INDEX}",
+            ),
+            # "slopes": RandomAssetCfg(
+            #     rigid_object_cfg=RigidObjectCfg(    
+            #         prim_path="/World/static/Slopes/Slope_*",
+            #         spawn=sim_utils.UsdFileCfg(
+            #             usd_path=f"{NUCLEUS_ASSET_ROOT_DIR}/Isaac/Environments/Terrains/slope.usd",
+            #             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            #             mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+            #             collision_props=sim_utils.CollisionPropertiesCfg(),
+            #             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.8, 0.8), metallic=0.2),
+            #         ),
+            #         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
+            #     ),
+            #     proportion=0.45,
+            #     pos_range_x=(2.0, 4.0),
+            #     pos_range_y=(-2.0, 2.0),
+            #     pos_range_z=(0.5, 2.0),
+            #     rot_range_z=(0.0, 6.28318),  # Full rotation around Z axis
+            #     prim_path_template="/World/static/Slopes/Slope_{ASSET_INDEX}",
+            # ),
+        },
+        total_global_assets=20,
+        use_proportions=True,
+        seed=42,
+        enable_collision_avoidance=True,
+        min_distance_between_assets=0.5,
+        debug_vis=False,
     )
-    #,rot=(0.924,0.383,0,0)
-    cfg = RigidObjectCfg(
-        prim_path="/World/static/ball",
-        spawn=sim_utils.SphereCfg(
-            radius=0.3,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, -1, 3.0))
-    )
-    # random_assets = RandomAssetsImporterCfg(
-    #     seed=99,  # For reproducible results
-    #     total_global_assets=30, # Spawn 3 random assets per environment
-    #     use_proportions=True,
-    #     enable_collision_avoidance=True,
-    #     min_distance_between_assets=2.0,
-    #     debug_vis=True,
-    #     assets={
-    #         "stairs": RandomAssetCfg(
-    #             usd_path=f"{NUCLEUS_ASSET_ROOT_DIR}/Isaac/Environments/Terrains/stairs.usd",
-    #             prim_path="/World/stairs/stairs_{ASSET_INDEX}",
-    #             proportion=0.5,
-    #             pos_range_x=(-50.0, 50.0),
-    #             pos_range_y=(-50.0, 50.0),
-    #             pos_range_z=(0.0, 0.),
-    #             rot_range_z=(0.0, 0),  # Full rotation around Z axis
-    #             scale_range=(0.8, 1.2),
-    #             collision_group=-1,
-    #         ),
-    #         "slopes": RandomAssetCfg(
-    #             usd_path=f"{NUCLEUS_ASSET_ROOT_DIR}/Isaac/Environments/Terrains/slope.usd",
-    #             prim_path = "/World/slopes/slopes_{ASSET_INDEX}",
-    #             proportion=0.5,
-    #             pos_range_x=(-50.0, 50.0),
-    #             pos_range_y=(-50.0, 50.0),
-    #             pos_range_z=(0.0, 0.),
-    #             rot_range_z=(0.0, 0),  # Full rotation around Z axis
-    #             scale_range=(0.8, 1.2),
-    #             collision_group=-1,),
-    #     }
-    # )
 
 
 

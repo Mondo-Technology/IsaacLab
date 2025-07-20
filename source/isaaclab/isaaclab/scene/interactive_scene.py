@@ -21,6 +21,8 @@ from isaaclab.assets import (
     AssetBaseCfg,
     DeformableObject,
     DeformableObjectCfg,
+    RandomAssetsImporter,
+    RandomAssetsImporterCfg,
     RigidObject,
     RigidObjectCfg,
     RigidObjectCollection,
@@ -116,7 +118,9 @@ class InteractiveScene:
         self._articulations = dict()
         self._deformable_objects = dict()
         self._rigid_objects = dict()
+        self._rigid_objects_random_global = dict()  # Global random assets RigidObjects (not reset per env)
         self._rigid_object_collections = dict()
+        self._random_assets = dict()
         self._sensors = dict()
         self._extras = dict()
         # obtain the current stage
@@ -330,9 +334,23 @@ class InteractiveScene:
         return self._rigid_objects
 
     @property
+    def rigid_objects_random_global(self) -> dict[str, RigidObject]:
+        """A dictionary of global random assets rigid objects in the scene.
+        
+        These are RigidObjects created by RandomAssetsImporter that are global
+        and should not be reset per environment.
+        """
+        return self._rigid_objects_random_global
+
+    @property
     def rigid_object_collections(self) -> dict[str, RigidObjectCollection]:
         """A dictionary of rigid object collections in the scene."""
         return self._rigid_object_collections
+
+    @property
+    def random_assets(self) -> dict[str, RandomAssetsImporter]:
+        """A dictionary of random assets importers in the scene."""
+        return self._random_assets
 
     @property
     def sensors(self) -> dict[str, SensorBase]:
@@ -386,6 +404,8 @@ class InteractiveScene:
             rigid_object.reset(env_ids)
         for rigid_object_collection in self._rigid_object_collections.values():
             rigid_object_collection.reset(env_ids)
+        for random_assets in self._random_assets.values():
+            random_assets.reset(env_ids)
         # -- sensors
         for sensor in self._sensors.values():
             sensor.reset(env_ids)
@@ -401,6 +421,12 @@ class InteractiveScene:
             rigid_object.write_data_to_sim()
         for rigid_object_collection in self._rigid_object_collections.values():
             rigid_object_collection.write_data_to_sim()
+        # Global random assets RigidObjects
+        for rigid_object in self._rigid_objects_random_global.values():
+            rigid_object.write_data_to_sim()
+        # Random assets importers (handles their own RigidObjects)
+        for random_assets in self._random_assets.values():
+            random_assets.write_data_to_sim()
 
     def update(self, dt: float) -> None:
         """Update the scene entities.
@@ -417,6 +443,12 @@ class InteractiveScene:
             rigid_object.update(dt)
         for rigid_object_collection in self._rigid_object_collections.values():
             rigid_object_collection.update(dt)
+        # Global random assets RigidObjects
+        for rigid_object in self._rigid_objects_random_global.values():
+            rigid_object.update(dt)
+        # Random assets importers (handles their own RigidObjects)
+        for random_assets in self._random_assets.values():
+            random_assets.update(dt)
         # -- sensors
         for sensor in self._sensors.values():
             sensor.update(dt, force_recompute=not self.cfg.lazy_sensor_update)
@@ -582,7 +614,9 @@ class InteractiveScene:
             self._articulations,
             self._deformable_objects,
             self._rigid_objects,
+            self._rigid_objects_random_global,
             self._rigid_object_collections,
+            self._random_assets,
             self._sensors,
             self._extras,
         ]:
@@ -608,7 +642,9 @@ class InteractiveScene:
             self._articulations,
             self._deformable_objects,
             self._rigid_objects,
+            self._rigid_objects_random_global,
             self._rigid_object_collections,
+            self._random_assets,
             self._sensors,
             self._extras,
         ]:
@@ -668,6 +704,23 @@ class InteractiveScene:
                     if hasattr(rigid_object_cfg, "collision_group") and rigid_object_cfg.collision_group == -1:
                         asset_paths = sim_utils.find_matching_prim_paths(rigid_object_cfg.prim_path)
                         self._global_prim_paths += asset_paths
+            elif isinstance(asset_cfg, RandomAssetsImporterCfg):
+                # Random assets are global and don't need ENV_REGEX_NS formatting
+                # They handle their own prim path generation and create RigidObjects
+                random_assets_importer = asset_cfg.class_type(asset_cfg)
+                self._random_assets[asset_name] = random_assets_importer
+                
+                # Add the RigidObjects to the global random assets collection so they can be accessed
+                # but keep them separate from regular rigid_objects to avoid per-environment reset
+                for rigid_object_name, rigid_object_list in random_assets_importer.rigid_objects.items():
+                    for i, rigid_object in enumerate(rigid_object_list):
+                        # Use a composite name to avoid conflicts: "random_assets_name.rigid_object_name.index"
+                        composite_name = f"{asset_name}_{rigid_object_name}_{i}"
+                        self._rigid_objects_random_global[composite_name] = rigid_object
+                        
+                        # Get all prim paths from each RigidObject for collision filtering
+                        if hasattr(rigid_object, 'prim_paths') and rigid_object.prim_paths:
+                            self._global_prim_paths += rigid_object.prim_paths
             elif isinstance(asset_cfg, SensorBaseCfg):
                 # Update target frame path(s)' regex name space for FrameTransformer
                 if isinstance(asset_cfg, FrameTransformerCfg):
