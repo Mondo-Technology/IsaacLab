@@ -10,6 +10,8 @@ from __future__ import annotations
 import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 from isaaclab.assets.rigid_object import RigidObjectCfg
+from isaaclab.assets import AssetBaseCfg
+from dataclasses import MISSING
 
 from .random_assets import RandomAssetsImporter
 
@@ -18,8 +20,15 @@ from .random_assets import RandomAssetsImporter
 class RandomAssetCfg:
     """Configuration for a single random asset type."""
 
-    rigid_object_cfg: RigidObjectCfg = RigidObjectCfg()
-    """RigidObjectCfg for this asset type. This provides full control over the object."""
+    # Asset type configuration
+    asset_type: str = "rigid_object"
+    """Type of asset to create: 'rigid_object' for physics simulation or 'static' for static geometry."""
+
+    rigid_object_cfg: RigidObjectCfg | None = None
+    """RigidObjectCfg for this asset type. Only used when asset_type='rigid_object'."""
+    
+    static_asset_cfg: AssetBaseCfg | None = None
+    """AssetBaseCfg for static assets. Only used when asset_type='static'."""
 
     proportion: float = 1.0
     """Proportion of this asset type in the total mix. Used when use_proportions=True."""
@@ -48,18 +57,41 @@ class RandomAssetCfg:
     prim_path_template: str = "/World/{ASSET_NAME}/{ASSET_NAME}_{ASSET_INDEX}"
     """Template for prim path. {ASSET_NAME} and {ASSET_INDEX} will be replaced."""
 
-    # Velocity control configuration
+    # Velocity control configuration (only for rigid_object type)
     enable_velocity_control: bool = False
-    """Whether to enable continuous velocity control for this asset type."""
+    """Whether to enable continuous velocity control for this asset type. Only works with asset_type='rigid_object'."""
     
     linear_velocity_range: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = ((-1.0, 1.0), (-1.0, 1.0), (-0.5, 0.5))
-    """Range for random linear velocities in world frame: ((x_min, x_max), (y_min, y_max), (z_min, z_max))."""
+    """Range for random linear velocities in world frame: ((x_min, x_max), (y_min, y_max), (z_min, z_max)). Only works with asset_type='rigid_object'."""
     
     angular_velocity_range: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = ((-0.5, 0.5), (-0.5, 0.5), (-1.0, 1.0))
-    """Range for random angular velocities in world frame: ((x_min, x_max), (y_min, y_max), (z_min, z_max))."""
+    """Range for random angular velocities in world frame: ((x_min, x_max), (y_min, y_max), (z_min, z_max)). Only works with asset_type='rigid_object'."""
     
     velocity_update_frequency: float = 1.0
-    """Frequency (in Hz) to update random velocities. Lower values change velocity less often."""
+    """Frequency (in Hz) to update random velocities. Lower values change velocity less often. Only works with asset_type='rigid_object'."""
+
+    def __post_init__(self):
+        """Post-initialization validation and setup."""
+        # Validate asset type
+        if self.asset_type not in ["rigid_object", "static"]:
+            raise ValueError(f"asset_type must be 'rigid_object' or 'static', got '{self.asset_type}'")
+        
+        # Initialize the appropriate configuration based on asset type
+        if self.asset_type == "rigid_object":
+            if self.rigid_object_cfg is None:
+                self.rigid_object_cfg = RigidObjectCfg()
+            # Set static_asset_cfg to None to avoid validation issues
+            self.static_asset_cfg = None
+        elif self.asset_type == "static":
+            if self.static_asset_cfg is None:
+                self.static_asset_cfg = AssetBaseCfg()
+            # Set rigid_object_cfg to None to avoid validation issues
+            self.rigid_object_cfg = None
+        
+        # Disable velocity control for static assets
+        if self.asset_type == "static" and self.enable_velocity_control:
+            print(f"Warning: Velocity control is not supported for static assets. Disabling velocity control.")
+            self.enable_velocity_control = False
 
 
 @configclass

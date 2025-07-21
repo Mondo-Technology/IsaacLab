@@ -19,6 +19,7 @@ import isaacsim.core.utils.prims as prim_utils
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.assets.rigid_object import RigidObject, RigidObjectCfg
+from isaaclab.assets import AssetBaseCfg
 
 if TYPE_CHECKING:
     from .random_assets_cfg import RandomAssetsImporterCfg
@@ -30,21 +31,27 @@ class RandomAssetsImporter:
     This class manages the spawning of multiple random assets of different types across the scene.
     Unlike other assets, these are spawned globally in /World/ space, not per environment.
     
-    Each asset type creates a RigidObject that provides full physics simulation and control APIs.
+    Supports two asset types:
+    - RigidObjects: Full physics simulation with control APIs (velocity control, forces, etc.)
+    - Static Assets: Geometry-only assets for decoration/terrain (no physics simulation)
     
     The class handles:
     - Random placement of assets based on configured ranges
     - Proportional distribution of different asset types
     - Optional collision avoidance between assets
     - Seeded random generation for reproducibility
-    - Full RigidObject API access for each asset type
+    - Full RigidObject API access for physics-enabled assets
+    - Velocity control for RigidObjects (not available for static assets)
     """
 
     cfg: RandomAssetsImporterCfg
     """Configuration for the random assets importer."""
 
     rigid_objects: dict[str, list[RigidObject]]
-    """Dictionary of RigidObject lists for each asset type."""
+    """Dictionary of RigidObject lists for each rigid asset type."""
+    
+    static_assets: dict[str, list[dict]]
+    """Dictionary of static asset data for each static asset type."""
 
     _spawned_positions: list[tuple[float, float, float]]
     """List of spawned asset positions for collision avoidance."""
@@ -67,6 +74,7 @@ class RandomAssetsImporter:
         
         # Initialize RigidObject collections
         self.rigid_objects = {}
+        self.static_assets = {}
         
         # Store the spawned asset positions for collision avoidance
         self._spawned_positions = []
@@ -238,7 +246,7 @@ class RandomAssetsImporter:
         return True
 
     def _spawn_random_assets(self):
-        """Spawn all random assets according to the configuration using individual RigidObjects."""
+        """Spawn all random assets according to the configuration using RigidObjects or static assets."""
         if not self.cfg.assets:
             print("Warning: No assets configured for RandomAssetsImporter")
             return
@@ -248,9 +256,10 @@ class RandomAssetsImporter:
         
         print(f"RandomAssetsImporter: Spawning {sum(asset_counts.values())} total assets:")
         for asset_name, count in asset_counts.items():
-            print(f"  - {asset_name}: {count} instances")
+            asset_cfg = self.cfg.assets[asset_name]
+            print(f"  - {asset_name}: {count} instances ({asset_cfg.asset_type})")
         
-        # Create individual RigidObjects for each asset instance
+        # Create assets for each asset type
         for asset_name, count in asset_counts.items():
             asset_cfg = self.cfg.assets[asset_name]
             
@@ -261,66 +270,133 @@ class RandomAssetsImporter:
             positions = self._generate_random_positions(asset_cfg, count)
             rotations = self._generate_random_rotations(asset_cfg, count)
             
-            # Create a list to store individual RigidObjects for this asset type
-            asset_rigid_objects = []
-            
-            # Create individual RigidObject for each instance
-            for i in range(count):
-                # Generate specific prim path for this instance
-                prim_path = asset_cfg.prim_path_template.replace("{ASSET_NAME}", asset_name).replace("{ASSET_INDEX}", str(i))
-                
-                # Get position and rotation for this instance
-                pos = positions[i].tolist()
-                rot = rotations[i].tolist()  # [w, x, y, z]
-                
-                # Generate random scale
-                scale = random.uniform(asset_cfg.scale_range[0], asset_cfg.scale_range[1])
-                
-                try:
-                    # Create a copy of the RigidObjectCfg for this specific instance
-                    rigid_cfg = RigidObjectCfg()
-                    for key, value in asset_cfg.rigid_object_cfg.__dict__.items():
-                        if hasattr(rigid_cfg, key):
-                            setattr(rigid_cfg, key, value)
-                    
-                    # Set the specific prim path (no wildcards)
-                    rigid_cfg.prim_path = prim_path
-                    
-                    # Set initial state
-                    if hasattr(rigid_cfg.init_state, 'pos'):
-                        rigid_cfg.init_state.pos = tuple(pos)
-                    if hasattr(rigid_cfg.init_state, 'rot'):
-                        rigid_cfg.init_state.rot = tuple(rot)
-                    
-                    # Apply scaling by removing it for now - will implement later
-                    # TODO: Implement proper scaling support
-                    
-                    # Create the individual RigidObject
-                    rigid_object = RigidObject(cfg=rigid_cfg)
-                    asset_rigid_objects.append(rigid_object)
-                    
-                except Exception as e:
-                    print(f"Error creating RigidObject for {asset_name}_{i}: {e}")
-                    continue
-            
-            if asset_rigid_objects:
-                # Store the list of RigidObjects for this asset type
-                self.rigid_objects[asset_name] = asset_rigid_objects
-                print(f"Successfully created {len(asset_rigid_objects)} RigidObjects for {asset_name}")
-                
-                # Initialize velocities for velocity-controlled assets
-                asset_cfg = self.cfg.assets[asset_name]
-                if asset_cfg.enable_velocity_control:
-                    initial_velocities = self._generate_random_velocities(asset_cfg, len(asset_rigid_objects))
-                    self._asset_velocities[asset_name] = initial_velocities
-                    print(f"Initialized velocity control for {asset_name} with {len(asset_rigid_objects)} objects")
+            if asset_cfg.asset_type == "rigid_object":
+                self._spawn_rigid_objects(asset_name, asset_cfg, count, positions, rotations)
+            elif asset_cfg.asset_type == "static":
+                self._spawn_static_assets(asset_name, asset_cfg, count, positions, rotations)
             else:
-                print(f"Warning: No RigidObjects created for asset type {asset_name}")
+                print(f"Warning: Unknown asset type '{asset_cfg.asset_type}' for {asset_name}")
+
+    def _spawn_rigid_objects(self, asset_name: str, asset_cfg, count: int, positions: torch.Tensor, rotations: torch.Tensor):
+        """Spawn RigidObjects for a specific asset type."""
+        if asset_cfg.rigid_object_cfg is None:
+            print(f"Error: No rigid_object_cfg provided for rigid_object asset type {asset_name}")
+            return
+            
+        asset_rigid_objects = []
+        
+        # Create individual RigidObject for each instance
+        for i in range(count):
+            # Generate specific prim path for this instance
+            prim_path = asset_cfg.prim_path_template.replace("{ASSET_NAME}", asset_name).replace("{ASSET_INDEX}", str(i))
+            
+            # Get position and rotation for this instance
+            pos = positions[i].tolist()
+            rot = rotations[i].tolist()  # [w, x, y, z]
+            
+            # Generate random scale
+            scale = random.uniform(asset_cfg.scale_range[0], asset_cfg.scale_range[1])
+            
+            try:
+                # Create a copy of the RigidObjectCfg for this specific instance
+                rigid_cfg = RigidObjectCfg()
+                for key, value in asset_cfg.rigid_object_cfg.__dict__.items():
+                    if hasattr(rigid_cfg, key):
+                        setattr(rigid_cfg, key, value)
+                
+                # Set the specific prim path (no wildcards)
+                rigid_cfg.prim_path = prim_path
+                
+                # Set initial state
+                if hasattr(rigid_cfg.init_state, 'pos'):
+                    rigid_cfg.init_state.pos = tuple(pos)
+                if hasattr(rigid_cfg.init_state, 'rot'):
+                    rigid_cfg.init_state.rot = tuple(rot)
+                
+                # Apply scaling by removing it for now - will implement later
+                # TODO: Implement proper scaling support
+                
+                # Create the individual RigidObject
+                rigid_object = RigidObject(cfg=rigid_cfg)
+                asset_rigid_objects.append(rigid_object)
+                
+            except Exception as e:
+                print(f"Error creating RigidObject for {asset_name}_{i}: {e}")
+                continue
+        
+        if asset_rigid_objects:
+            # Store the list of RigidObjects for this asset type
+            self.rigid_objects[asset_name] = asset_rigid_objects
+            print(f"Successfully created {len(asset_rigid_objects)} RigidObjects for {asset_name}")
+            
+            # Initialize velocities for velocity-controlled assets
+            if asset_cfg.enable_velocity_control:
+                initial_velocities = self._generate_random_velocities(asset_cfg, len(asset_rigid_objects))
+                self._asset_velocities[asset_name] = initial_velocities
+                print(f"Initialized velocity control for {asset_name} with {len(asset_rigid_objects)} objects")
+        else:
+            print(f"Warning: No RigidObjects created for asset type {asset_name}")
+
+    def _spawn_static_assets(self, asset_name: str, asset_cfg, count: int, positions: torch.Tensor, rotations: torch.Tensor):
+        """Spawn static assets for a specific asset type using proper asset spawning."""
+        if asset_cfg.static_asset_cfg is None:
+            print(f"Error: No static_asset_cfg provided for static asset type {asset_name}")
+            return
+            
+        asset_static_objects = []
+        
+        # Create individual static assets for each instance
+        for i in range(count):
+            # Generate specific prim path for this instance
+            prim_path = asset_cfg.prim_path_template.replace("{ASSET_NAME}", asset_name).replace("{ASSET_INDEX}", str(i))
+            
+            # Get position and rotation for this instance
+            pos = positions[i].tolist()
+            rot = rotations[i].tolist()  # [w, x, y, z]
+            
+            # Generate random scale
+            scale = random.uniform(asset_cfg.scale_range[0], asset_cfg.scale_range[1])
+            
+            try:
+                # Get the spawn configuration from static_asset_cfg
+                static_asset_cfg = asset_cfg.static_asset_cfg
+                
+                # Use the proper spawning pattern like InteractiveScene
+                if static_asset_cfg.spawn is not None:
+                    static_asset_cfg.spawn.func(
+                        prim_path,
+                        static_asset_cfg.spawn,
+                        translation=pos,
+                        orientation=rot,
+                    )
+                
+                # Store information about the spawned static asset
+                static_asset_data = {
+                    "prim_path": prim_path,
+                    "spawn_cfg": static_asset_cfg.spawn,
+                    "position": pos,
+                    "rotation": rot,
+                    "scale": scale,
+                }
+                asset_static_objects.append(static_asset_data)
+                
+            except Exception as e:
+                print(f"Error creating static asset for {asset_name}_{i}: {e}")
+                continue
+        
+        if asset_static_objects:
+            # Store the list of static asset data for this asset type
+            self.static_assets[asset_name] = asset_static_objects
+            print(f"Successfully created {len(asset_static_objects)} static assets for {asset_name}")
+        else:
+            print(f"Warning: No static assets created for asset type {asset_name}")
 
     @property
     def num_assets(self) -> int:
         """Total number of successfully spawned asset instances across all types."""
-        return sum(len(obj_list) for obj_list in self.rigid_objects.values())
+        rigid_count = sum(len(obj_list) for obj_list in self.rigid_objects.values())
+        static_count = sum(len(obj_list) for obj_list in self.static_assets.values())
+        return rigid_count + static_count
 
     def get_rigid_object(self, asset_name: str) -> list[RigidObject] | None:
         """Get the RigidObjects for a specific asset type.
@@ -333,6 +409,17 @@ class RandomAssetsImporter:
         """
         return self.rigid_objects.get(asset_name)
 
+    def get_static_asset(self, asset_name: str) -> list[dict] | None:
+        """Get the static assets for a specific asset type.
+        
+        Args:
+            asset_name: Name of the asset type.
+            
+        Returns:
+            List of static asset data or None if not found.
+        """
+        return self.static_assets.get(asset_name)
+
     def get_all_rigid_objects(self) -> dict[str, list[RigidObject]]:
         """Get all RigidObject instances.
         
@@ -341,14 +428,42 @@ class RandomAssetsImporter:
         """
         return self.rigid_objects.copy()
 
+    def get_all_static_assets(self) -> dict[str, list[dict]]:
+        """Get all static asset instances.
+        
+        Returns:
+            Dictionary mapping asset names to lists of static asset data.
+        """
+        return self.static_assets.copy()
+
+    def get_asset_info(self) -> dict[str, dict]:
+        """Get information about all assets.
+        
+        Returns:
+            Dictionary with asset information including type and count.
+        """
+        info = {}
+        for asset_name, asset_cfg in self.cfg.assets.items():
+            rigid_objects = self.rigid_objects.get(asset_name, [])
+            static_assets = self.static_assets.get(asset_name, [])
+            
+            info[asset_name] = {
+                "asset_type": asset_cfg.asset_type,
+                "rigid_object_count": len(rigid_objects),
+                "static_asset_count": len(static_assets),
+                "total_count": len(rigid_objects) + len(static_assets),
+                "velocity_control_enabled": asset_cfg.enable_velocity_control if asset_cfg.asset_type == "rigid_object" else False,
+            }
+        return info
+
     def write_data_to_sim(self):
-        """Write data to simulation for all RigidObjects."""
+        """Write data to simulation for RigidObjects. Static assets don't need this."""
         for rigid_object_list in self.rigid_objects.values():
             for rigid_object in rigid_object_list:
                 rigid_object.write_data_to_sim()
 
     def update(self, dt: float):
-        """Update all RigidObjects and apply velocity control.
+        """Update RigidObjects and apply velocity control. Static assets don't need updates.
         
         Args:
             dt: Simulation time step.
@@ -359,13 +474,13 @@ class RandomAssetsImporter:
         # Update velocities and apply to RigidObjects
         self._update_and_apply_velocities(dt)
         
-        # Update all RigidObjects
+        # Update all RigidObjects (static assets don't need updates)
         for rigid_object_list in self.rigid_objects.values():
             for rigid_object in rigid_object_list:
                 rigid_object.update(dt)
 
     def _update_and_apply_velocities(self, dt: float):
-        """Update and apply velocities to velocity-controlled assets.
+        """Update and apply velocities to velocity-controlled rigid object assets.
         
         Args:
             dt: Simulation time step.
@@ -373,8 +488,8 @@ class RandomAssetsImporter:
         for asset_name, rigid_object_list in self.rigid_objects.items():
             asset_cfg = self.cfg.assets[asset_name]
             
-            # Skip if velocity control is not enabled for this asset type
-            if not asset_cfg.enable_velocity_control:
+            # Skip if not a rigid object or velocity control is not enabled
+            if asset_cfg.asset_type != "rigid_object" or not asset_cfg.enable_velocity_control:
                 continue
                 
             # Check if it's time to update velocities based on frequency
@@ -397,11 +512,11 @@ class RandomAssetsImporter:
                         except Exception as e:
                             print(f"Error applying velocity to {asset_name}_{i}: {e}")
         
-        # Reset velocity timer if it exceeded the update interval
+        # Reset velocity timer if it exceeded the update interval for rigid objects
         min_update_interval = float('inf')
         for asset_name in self.rigid_objects.keys():
             asset_cfg = self.cfg.assets[asset_name]
-            if asset_cfg.enable_velocity_control:
+            if asset_cfg.asset_type == "rigid_object" and asset_cfg.enable_velocity_control:
                 update_interval = 1.0 / asset_cfg.velocity_update_frequency
                 min_update_interval = min(min_update_interval, update_interval)
         
@@ -409,7 +524,7 @@ class RandomAssetsImporter:
             self._velocity_timer = 0.0
 
     def reset(self, env_ids: list[int] | None = None):
-        """Reset all RigidObjects.
+        """Reset RigidObjects. Static assets don't need reset.
         
         Args:
             env_ids: Environment IDs to reset. Since these are global assets, this is ignored.
@@ -419,25 +534,26 @@ class RandomAssetsImporter:
                 rigid_object.reset()
 
     def get_velocity_control_info(self) -> dict[str, dict]:
-        """Get information about velocity control for all asset types.
+        """Get information about velocity control for rigid object asset types.
         
         Returns:
-            Dictionary with velocity control information for each asset type.
+            Dictionary with velocity control information for each rigid object asset type.
         """
         info = {}
         for asset_name, asset_cfg in self.cfg.assets.items():
-            info[asset_name] = {
-                "velocity_control_enabled": asset_cfg.enable_velocity_control,
-                "num_objects": len(self.rigid_objects.get(asset_name, [])),
-                "linear_velocity_range": asset_cfg.linear_velocity_range,
-                "angular_velocity_range": asset_cfg.angular_velocity_range,
-                "update_frequency": asset_cfg.velocity_update_frequency,
-                "current_velocities": self._asset_velocities.get(asset_name)
-            }
+            if asset_cfg.asset_type == "rigid_object":
+                info[asset_name] = {
+                    "velocity_control_enabled": asset_cfg.enable_velocity_control,
+                    "num_objects": len(self.rigid_objects.get(asset_name, [])),
+                    "linear_velocity_range": asset_cfg.linear_velocity_range,
+                    "angular_velocity_range": asset_cfg.angular_velocity_range,
+                    "update_frequency": asset_cfg.velocity_update_frequency,
+                    "current_velocities": self._asset_velocities.get(asset_name)
+                }
         return info
 
     def set_asset_velocities(self, asset_name: str, velocities: torch.Tensor):
-        """Manually set velocities for a specific asset type.
+        """Manually set velocities for a specific rigid object asset type.
         
         Args:
             asset_name: Name of the asset type.
@@ -445,9 +561,11 @@ class RandomAssetsImporter:
         """
         if asset_name in self.rigid_objects and asset_name in self.cfg.assets:
             asset_cfg = self.cfg.assets[asset_name]
-            if asset_cfg.enable_velocity_control:
+            if asset_cfg.asset_type == "rigid_object" and asset_cfg.enable_velocity_control:
                 self._asset_velocities[asset_name] = velocities
                 print(f"Set custom velocities for {asset_name}")
+            elif asset_cfg.asset_type != "rigid_object":
+                print(f"Warning: Velocity control is only supported for rigid_object assets, {asset_name} is {asset_cfg.asset_type}")
             else:
                 print(f"Warning: Velocity control is not enabled for {asset_name}")
         else:
