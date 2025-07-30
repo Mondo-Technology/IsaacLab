@@ -25,6 +25,7 @@ from isaaclab.markers import VisualizationMarkers
 from isaaclab.terrains.trimesh.utils import make_plane
 from isaaclab.utils.math import convert_quat, quat_apply, quat_apply_yaw
 from isaaclab.utils.warp import convert_to_warp_mesh, raycast_mesh
+import isaacsim.core.utils.stage as stage_utils
 
 from ..sensor_base import SensorBase
 from .ray_caster_data import RayCasterData
@@ -181,6 +182,10 @@ class RayCaster(SensorBase):
             # Explicit paths mode: process each provided mesh path and find all instances
         omni.log.info(f"Processing {len(self.cfg.mesh_prim_paths)} explicit mesh paths for ray casting...")
         
+        # First pass: Make all prims uninstanceable to enable proper discovery
+        for mesh_prim_path in self.cfg.mesh_prim_paths:
+            self._make_prims_uninstanceable_for_discovery(mesh_prim_path)
+        
         for mesh_prim_path in self.cfg.mesh_prim_paths:
             omni.log.info(f"Processing mesh path: {mesh_prim_path}")
             
@@ -276,6 +281,10 @@ class RayCaster(SensorBase):
         supported_geometry_types = ["Mesh", "Plane", "Sphere", "Cube", "Cylinder", "Capsule", "Cone"]
         
         omni.log.info("Setting up dynamic mesh system for ray caster...")
+        
+        # First pass: Make all prims uninstanceable to enable proper discovery
+        for mesh_prim_path in self.cfg.mesh_prim_paths:
+            self._make_prims_uninstanceable_for_discovery(mesh_prim_path)
         
         # Process each mesh path to extract geometry data for dynamic tracking
         for mesh_prim_path in self.cfg.mesh_prim_paths:
@@ -911,6 +920,49 @@ class RayCaster(SensorBase):
             face_idx += count
         
         return triangulated_faces
+
+    def _make_prims_uninstanceable_for_discovery(self, prim_path: str) -> None:
+        """Make all prims under the given path uninstanceable to enable geometry discovery.
+        
+        When parent prims have SetInstanceable(True), their children become instanced and 
+        cannot be found by get_all_matching_child_prims(). This function recursively makes
+        all prims uninstanceable to allow proper geometry discovery.
+        
+        Args:
+            prim_path: The root prim path to start making uninstanceable
+        """
+        try:
+            stage = stage_utils.get_current_stage()
+            root_prim = stage.GetPrimAtPath(prim_path)
+            
+            if not root_prim or not root_prim.IsValid():
+                omni.log.warn(f"Invalid prim path for uninstanceable conversion: {prim_path}")
+                return
+                
+            # Use USD traversal to find all instanced prims
+            prims_to_process = [root_prim]
+            made_uninstanceable_count = 0
+            
+            while len(prims_to_process) > 0:
+                current_prim = prims_to_process.pop(0)
+                
+                # Check if this prim is instanced and make it uninstanceable
+                if current_prim.IsInstance():
+                    current_prim.SetInstanceable(False)
+                    made_uninstanceable_count += 1
+                    omni.log.info(f"Made uninstanceable: {current_prim.GetPath().pathString}")
+                
+                # Add all children to processing queue
+                children = current_prim.GetChildren()
+                prims_to_process.extend(children)
+            
+            if made_uninstanceable_count > 0:
+                omni.log.info(f"Made {made_uninstanceable_count} prims uninstanceable under: {prim_path}")
+                # Force stage reload to ensure changes take effect
+                stage.Reload()
+            
+        except Exception as e:
+            omni.log.warn(f"Error making prims uninstanceable for {prim_path}: {str(e)}")
 
     def _update_combined_mesh_efficiently(self):
         """Efficiently update the combined mesh using vectorized operations."""

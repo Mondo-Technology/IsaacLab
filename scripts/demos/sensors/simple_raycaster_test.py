@@ -109,14 +109,17 @@ class MySceneCfg(InteractiveSceneCfg):
         ray_alignment='yaw',
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
         debug_vis=False,
-        mesh_prim_paths=["/World/ground", "/World/random_blocks", "/World/random_instances", "/World/static","/World/slopes"],
+        mesh_prim_paths=["/World/ground", "/World/random_blocks", "/World/random_instances","/World/slopes"],
     )
     height_scanner_vis = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0), rot=(1, 0, 0., 0.)),
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[10., 10.0]),
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1, 0, 0., 0.)),
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=100, vertical_fov_range=[-90, 90], horizontal_fov_range=[-90, 90], horizontal_res=1.0
+        ),
         debug_vis=True,
-        mesh_prim_paths=["/World/ground", "/World/random_blocks", "/World/random_instances", "/World/static","/World/slopes"],
+        #mesh_prim_paths=["/World/ground", "/World/random_blocks", "/World/random_instances", "/World/static","/World/slopes"],
+        mesh_prim_paths=["/World/static"],
     )
     #mesh_prim_paths=["/World/ground", "/World/envs/env_.*/stairs/.*", "/World/envs/env_.*/human/.*", "/World/envs/env_.*/cones/.*"],
     # Conditionally add LiDAR sensor based on args
@@ -148,63 +151,63 @@ class MySceneCfg(InteractiveSceneCfg):
     )
     random_assets = RandomAssetsImporterCfg(
         assets={
-            "cubes": RandomAssetCfg(
-                asset_type="rigid_object",
-                rigid_object_cfg=RigidObjectCfg(
-                    prim_path="/World/static/Cubes/Cube_*",
-                    spawn=sim_utils.CuboidCfg(
-                        size=(0.2, 0.2, 0.2),
-                        rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
-                        mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                        collision_props=sim_utils.CollisionPropertiesCfg(),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0), metallic=0.2),
-                    ),
-                    init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
-                ),
-                proportion=0.,
-                pos_range_x=(-10.0, 10.0),
-                pos_range_y=(-10.0, 10.0),
-                pos_range_z=(0.5, 0.5),
-                rot_range_z=(0.0, 6.28318),
-                rot_range_y = (0.0, 0.0),  
-                rot_range_x = (0.0, 0.0),  
-                prim_path_template="/World/static/Cubes/Cube_{ASSET_INDEX}",
-                enable_velocity_control=False,
-                linear_velocity_range=((-2, 2), (-1, 1), (-0., 0.)),
-                angular_velocity_range=((-1, 1), (-1, 1), (-1, 1)),
-                velocity_update_frequency=0.5,  # Update velocities every 2 seconds
-            ),
-            "spheres": RandomAssetCfg(
-                asset_type="rigid_object",
-                rigid_object_cfg=RigidObjectCfg(
-                    prim_path="/World/static/Spheres/Sphere_*",
-                    spawn=sim_utils.SphereCfg(
-                        radius=0.1,
-                        rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
-                        mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
-                        collision_props=sim_utils.CollisionPropertiesCfg(),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
-                    ),
-                    init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
-                ),
-                proportion=0.5,
-                pos_range_x=(-10.0, 10.0),
-                pos_range_y=(-10.0, 10.0),
-                pos_range_z=(0.5, 2.0),
-                rot_range_z=(0.0, 6.28318),
-                prim_path_template="/World/static/Spheres/Sphere_{ASSET_INDEX}",
-            ),
+            # "cubes": RandomAssetCfg(
+            #     asset_type="rigid_object",
+            #     rigid_object_cfg=RigidObjectCfg(
+            #         prim_path="/World/static/Cubes/Cube_*",
+            #         spawn=sim_utils.CuboidCfg(
+            #             size=(0.2, 0.2, 0.2),
+            #             rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
+            #             mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+            #             collision_props=sim_utils.CollisionPropertiesCfg(),
+            #             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0), metallic=0.2),
+            #         ),
+            #         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
+            #     ),
+            #     proportion=0.,
+            #     pos_range_x=(0.5, 6.0),
+            #     pos_range_y=(-3.0, 3.0),
+            #     pos_range_z=(0.5, 0.5),
+            #     rot_range_z=(0.0, 6.28318),
+            #     rot_range_y = (0.0, 0.0),  
+            #     rot_range_x = (0.0, 0.0),  
+            #     prim_path_template="/World/static/Cubes/Cube_{ASSET_INDEX}",
+            #     enable_velocity_control=False,
+            #     linear_velocity_range=((-2, 2), (-1, 1), (-0., 0.)),
+            #     angular_velocity_range=((-1, 1), (-1, 1), (-1, 1)),
+            #     velocity_update_frequency=0.5,  # Update velocities every 2 seconds
+            # ),
+            # "spheres": RandomAssetCfg(
+            #     asset_type="rigid_object",
+            #     rigid_object_cfg=RigidObjectCfg(
+            #         prim_path="/World/static/Spheres/Sphere_*",
+            #         spawn=sim_utils.SphereCfg(
+            #             radius=0.1,
+            #             rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
+            #             mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+            #             collision_props=sim_utils.CollisionPropertiesCfg(),
+            #             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
+            #         ),
+            #         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
+            #     ),
+            #     proportion=0.,
+            #     pos_range_x=(1.0, 5.0),
+            #     pos_range_y=(-3.0, 3.0),
+            #     pos_range_z=(0.5, 2.0),
+            #     rot_range_z=(0.0, 6.28318),
+            #     prim_path_template="/World/static/Spheres/Sphere_{ASSET_INDEX}",
+            # ),
 
             "slopes": RandomAssetCfg(
                 asset_type="static",
                 static_asset_cfg=AssetBaseCfg(    
                     prim_path="/World/static/Slopes/Slope_*",
                     spawn=sim_utils.UsdFileCfg(
-                        usd_path=f"{ISAAC_NUCLEUS_DIR}/Environments/Terrains/slope.usd",
+                        usd_path=f"{ISAAC_NUCLEUS_DIR}/Environments/Hospital/hospital.usd",
                     ),
                     init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
                 ),
-                proportion=0.5,
+                proportion=1,
                 pos_range_x=(0.5, 1.0),
                 pos_range_y=(-0.0, 0.0),
                 pos_range_z=(0., .0),
@@ -217,7 +220,7 @@ class MySceneCfg(InteractiveSceneCfg):
                 velocity_update_frequency=0.5,  # Update velocities every 2 seconds
             ),
         },
-        total_global_assets=30,
+        total_global_assets=1,
         use_proportions=True,
         seed=42,
         enable_collision_avoidance=False,
