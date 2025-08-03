@@ -86,7 +86,14 @@ class TerrainImporter:
             terrain_generator = self.cfg.terrain_generator.class_type(
                 cfg=self.cfg.terrain_generator, device=self.device
             )
-            self.import_mesh("terrain", terrain_generator.terrain_mesh)
+            if self.cfg.terrain_generator.plane_cover:
+                shifted_mesh = terrain_generator.terrain_mesh.copy()
+                mesh_offset = self.cfg.terrain_generator.mesh_offset
+                shifted_mesh.apply_translation((0.0, 0.0, mesh_offset))
+                self.import_mesh("terrain", shifted_mesh)
+                self.import_ground_plane("ground_plane")
+            else:
+                self.import_mesh("terrain", terrain_generator.terrain_mesh)
             # configure the terrain origins based on the terrain generator
             self.configure_env_origins(terrain_generator.terrain_origins)
             # refer to the flat patches
