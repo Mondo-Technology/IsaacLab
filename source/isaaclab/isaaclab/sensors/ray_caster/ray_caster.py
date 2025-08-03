@@ -8,9 +8,12 @@ from __future__ import annotations
 import numpy as np
 import re
 import torch
+import trimesh
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import isaacsim.core.utils.prims as prim_utils
+import isaacsim.core.utils.stage as stage_utils
 import omni.log
 import omni.physics.tensors.impl.api as physx
 import warp as wp
@@ -73,6 +76,12 @@ class RayCaster(SensorBase):
         self._data = RayCasterData()
         # the warp meshes used for raycasting.
         self.meshes: dict[str, wp.Mesh] = {}
+        # Dynamic mesh support - additional variables for efficient updates
+        self.combined_mesh: wp.Mesh | None = None
+        self.all_mesh_view: XFormPrim | None = None
+        self.all_base_points: torch.Tensor | None = None
+        self.vertex_counts_per_instance: torch.Tensor | None = None
+        self.mesh_instance_indices: torch.Tensor | None = None
 
     def __str__(self) -> str:
         """Returns: A string containing information about the instance."""
@@ -160,54 +169,189 @@ class RayCaster(SensorBase):
         self._initialize_rays_impl()
 
     def _initialize_warp_meshes(self):
-        # check number of mesh prims provided
-        if len(self.cfg.mesh_prim_paths) != 1:
-            raise NotImplementedError(
-                f"RayCaster currently only supports one mesh prim. Received: {len(self.cfg.mesh_prim_paths)}"
-            )
+        # Enhanced to support multiple geometry types by combining them into one
+        # Support both original single mesh path and automatic discovery of all geometries in /World/*
 
-        # read prims to ray-cast
+        combined_points = []
+        combined_indices = []
+        vertex_offset = 0
+        total_meshes_found = 0
+
+        # Define supported geometry types
+        supported_geometry_types = ["Mesh", "Plane", "Sphere", "Cube", "Cylinder", "Capsule", "Cone"]
+
+        # Check if we should discover meshes automatically or use provided paths
+        # Explicit paths mode: process each provided mesh path and find all instances
+        omni.log.info(f"Processing {len(self.cfg.mesh_prim_paths)} explicit mesh paths for ray casting...")
+
+        # First pass: Make all prims uninstanceable to enable proper discovery
         for mesh_prim_path in self.cfg.mesh_prim_paths:
-            # check if the prim is a plane - handle PhysX plane as a special case
-            # if a plane exists then we need to create an infinite mesh that is a plane
-            mesh_prim = sim_utils.get_first_matching_child_prim(
-                mesh_prim_path, lambda prim: prim.GetTypeName() == "Plane"
-            )
-            # if we did not find a plane then we need to read the mesh
-            if mesh_prim is None:
-                # obtain the mesh prim
-                mesh_prim = sim_utils.get_first_matching_child_prim(
-                    mesh_prim_path, lambda prim: prim.GetTypeName() == "Mesh"
-                )
-                # check if valid
-                if mesh_prim is None or not mesh_prim.IsValid():
-                    raise RuntimeError(f"Invalid mesh prim path: {mesh_prim_path}")
-                # cast into UsdGeomMesh
-                mesh_prim = UsdGeom.Mesh(mesh_prim)
-                # read the vertices and faces
-                points = np.asarray(mesh_prim.GetPointsAttr().Get())
-                transform_matrix = np.array(omni.usd.get_world_transform_matrix(mesh_prim)).T
-                points = np.matmul(points, transform_matrix[:3, :3].T)
-                points += transform_matrix[:3, 3]
-                indices = np.asarray(mesh_prim.GetFaceVertexIndicesAttr().Get())
-                wp_mesh = convert_to_warp_mesh(points, indices, device=self.device)
-                # print info
-                omni.log.info(
-                    f"Read mesh prim: {mesh_prim.GetPath()} with {len(points)} vertices and {len(indices)} faces."
-                )
-            else:
-                mesh = make_plane(size=(2e6, 2e6), height=0.0, center_zero=True)
-                wp_mesh = convert_to_warp_mesh(mesh.vertices, mesh.faces, device=self.device)
-                # print info
-                omni.log.info(f"Created infinite plane mesh prim: {mesh_prim.GetPath()}.")
-            # add the warp mesh to the list
-            self.meshes[mesh_prim_path] = wp_mesh
+            self._make_prims_uninstanceable_for_discovery(mesh_prim_path)
 
-        # throw an error if no meshes are found
-        if all([mesh_prim_path not in self.meshes for mesh_prim_path in self.cfg.mesh_prim_paths]):
-            raise RuntimeError(
-                f"No meshes found for ray-casting! Please check the mesh prim paths: {self.cfg.mesh_prim_paths}"
-            )
+        for mesh_prim_path in self.cfg.mesh_prim_paths:
+            omni.log.info(f"Processing mesh path: {mesh_prim_path}")
+
+            # Check if the prim path exists before processing
+            if not sim_utils.find_first_matching_prim(mesh_prim_path):
+                omni.log.warn(f"Mesh prim path does not exist: {mesh_prim_path} - skipping.")
+                continue
+
+            # Find all supported geometry prims under this path
+            all_geometry_prims = []
+            for geom_type in supported_geometry_types:
+                prims = sim_utils.get_all_matching_child_prims(
+                    mesh_prim_path, lambda prim, gt=geom_type: prim.GetTypeName() == gt
+                )
+                all_geometry_prims.extend(prims)
+
+            # If no geometry prims found directly, try to find exact match
+            if len(all_geometry_prims) == 0:
+                # Try to get exact prim
+                exact_prim = sim_utils.find_first_matching_prim(mesh_prim_path)
+                if exact_prim and exact_prim.IsValid() and exact_prim.GetTypeName() in supported_geometry_types:
+                    all_geometry_prims = [exact_prim]
+
+            # Process all found geometry prims using unified approach
+            meshes_for_this_path = 0
+            for geom_prim in all_geometry_prims:
+                mesh_data = self._extract_mesh_data_from_prim(geom_prim)
+                if mesh_data is not None:
+                    points, indices = mesh_data
+
+                    # Add vertex offset to indices for combining meshes
+                    offset_indices = indices + vertex_offset
+
+                    # Add to combined arrays
+                    combined_points.append(points)
+                    combined_indices.append(offset_indices)
+                    vertex_offset += len(points)
+                    total_meshes_found += 1
+                    meshes_for_this_path += 1
+
+                    prim_path_str = geom_prim.GetPath().pathString
+                    omni.log.info(
+                        f"Added {geom_prim.GetTypeName()}: {prim_path_str} with {len(points)} vertices,"
+                        f" {len(indices)} faces, transform applied."
+                    )
+
+            omni.log.info(f"Found {meshes_for_this_path} geometries for path: {mesh_prim_path}")
+
+        # Create combined mesh if we found any meshes
+        if total_meshes_found > 0:
+            # Combine all points and indices
+            final_points = np.vstack(combined_points)
+            final_indices = np.concatenate(combined_indices)
+
+            # Create single warp mesh from combined data
+            wp_mesh = convert_to_warp_mesh(final_points, final_indices, device=self.device)
+
+            # Store combined mesh with a standard key
+            combined_mesh_key = self.cfg.mesh_prim_paths[0]
+            self.meshes[combined_mesh_key] = wp_mesh
+
+            omni.log.info(f"Successfully combined {total_meshes_found} meshes into single mesh for ray casting.")
+            omni.log.info(f"Combined mesh has {len(final_points)} vertices and {len(final_indices)} faces.")
+        else:
+            # Fallback: create a default ground plane if no meshes found
+            omni.log.warn("No meshes found for ray-casting! Creating default ground plane.")
+            plane_mesh = make_plane(size=(2e6, 2e6), height=0.0, center_zero=True)
+            wp_mesh = convert_to_warp_mesh(plane_mesh.vertices, plane_mesh.faces, device=self.device)
+            self.meshes["default_ground"] = wp_mesh
+        if len(self.meshes) > 0:
+            self._setup_dynamic_mesh_system()
+
+    def _setup_dynamic_mesh_system(self):
+        """Set up the dynamic mesh tracking system for efficient updates."""
+        # Data structures for efficient mesh combination
+        all_mesh_prim_paths = []
+        combined_points = []
+        combined_indices = []
+        vertex_counts = []
+        vertex_offset = 0
+        total_meshes_found = 0
+
+        # Define supported geometry types
+        supported_geometry_types = ["Mesh", "Plane", "Sphere", "Cube", "Cylinder", "Capsule", "Cone"]
+
+        omni.log.info("Setting up dynamic mesh system for ray caster...")
+
+        # First pass: Make all prims uninstanceable to enable proper discovery
+        for mesh_prim_path in self.cfg.mesh_prim_paths:
+            self._make_prims_uninstanceable_for_discovery(mesh_prim_path)
+
+        # Process each mesh path to extract geometry data for dynamic tracking
+        for mesh_prim_path in self.cfg.mesh_prim_paths:
+            # Check if the prim path exists before processing
+            if not sim_utils.find_first_matching_prim(mesh_prim_path):
+                continue
+
+            # Find all supported geometry prims under this path
+            all_geometry_prims = []
+            for geom_type in supported_geometry_types:
+                prims = sim_utils.get_all_matching_child_prims(
+                    mesh_prim_path, lambda prim, gt=geom_type: prim.GetTypeName() == gt
+                )
+                all_geometry_prims.extend(prims)
+
+            # If no geometry prims found directly, try to find exact match
+            if len(all_geometry_prims) == 0:
+                exact_prim = sim_utils.find_first_matching_prim(mesh_prim_path)
+                if exact_prim and exact_prim.IsValid() and exact_prim.GetTypeName() in supported_geometry_types:
+                    all_geometry_prims = [exact_prim]
+
+            # Process all found geometry prims
+            for geom_prim in all_geometry_prims:
+                mesh_data = self._extract_mesh_data_from_prim_dynamic(geom_prim)
+                if mesh_data is not None:
+                    points, indices = mesh_data
+
+                    # Add vertex offset to indices for combining meshes
+                    offset_indices = indices + vertex_offset
+
+                    # Add to combined arrays
+                    combined_points.append(points)
+                    combined_indices.append(offset_indices)
+                    vertex_counts.append(len(points))
+                    vertex_offset += len(points)
+                    total_meshes_found += 1
+
+                    # Store prim path for XFormPrim view creation
+                    all_mesh_prim_paths.append(geom_prim.GetPath().pathString)
+            self.all_mesh_prim_paths = all_mesh_prim_paths
+
+        # Create the dynamic mesh system if we found meshes
+        if total_meshes_found > 0:
+            try:
+                # Combine all points and indices
+                final_points = np.vstack(combined_points)
+                final_indices = np.concatenate(combined_indices)
+
+                # Create single warp mesh from combined data
+                self.combined_mesh = convert_to_warp_mesh(final_points, final_indices, device=self.device)
+
+                # Create single XFormPrim view for all meshes
+                self.all_mesh_view = XFormPrim(self.all_mesh_prim_paths, reset_xform_properties=False)
+
+                # Setup efficient vectorized update system
+                self.all_base_points = torch.tensor(final_points, device=self.device, dtype=torch.float32)
+                self.vertex_counts_per_instance = torch.tensor(vertex_counts, device=self.device, dtype=torch.int32)
+
+                # Create mesh instance indices for mapping
+                self.mesh_instance_indices = torch.arange(total_meshes_found, device=self.device, dtype=torch.int32)
+
+                omni.log.info("Successfully set up dynamic mesh system:")
+                omni.log.info(f"  - Tracking {total_meshes_found} mesh instances")
+                omni.log.info(f"  - Total vertices: {len(final_points)}")
+                omni.log.info(f"  - Total faces: {len(final_indices) // 3}")
+
+            except Exception as e:
+                omni.log.warn(f"Failed to setup dynamic mesh system: {str(e)}")
+                # Reset dynamic mesh variables on failure
+                self.combined_mesh = None
+                self.all_mesh_view = None
+                self.all_base_points = None
+                self.vertex_counts_per_instance = None
+                self.mesh_instance_indices = None
 
     def _initialize_rays_impl(self):
         # compute ray stars and directions
@@ -250,7 +394,9 @@ class RayCaster(SensorBase):
         # store the poses
         self._data.pos_w[env_ids] = pos_w
         self._data.quat_w[env_ids] = quat_w
-
+        # Update dynamic meshes if available
+        if self.combined_mesh is not None:
+            self._update_combined_mesh_efficiently()
         # check if user provided attach_yaw_only flag
         if self.cfg.attach_yaw_only is not None:
             msg = (
@@ -292,12 +438,16 @@ class RayCaster(SensorBase):
             raise RuntimeError(f"Unsupported ray_alignment type: {self.cfg.ray_alignment}.")
 
         # ray cast and store the hits
-        # TODO: Make this work for multiple meshes?
+        if self.combined_mesh is not None:
+            mesh_to_use = self.combined_mesh
+        else:
+            mesh_to_use = self.meshes[self.cfg.mesh_prim_paths[0]]
+
         self._data.ray_hits_w[env_ids] = raycast_mesh(
             ray_starts_w,
             ray_directions_w,
             max_dist=self.cfg.max_distance,
-            mesh=self.meshes[self.cfg.mesh_prim_paths[0]],
+            mesh=mesh_to_use,
         )[0]
 
         # apply vertical drift to ray starting position in ray caster frame
@@ -332,3 +482,523 @@ class RayCaster(SensorBase):
         super()._invalidate_initialize_callback(event)
         # set all existing views to None to invalidate them
         self._view = None
+        # Invalidate dynamic mesh view as well
+        self.all_mesh_view = None
+
+    def _create_trimesh_from_usd_primitive(self, geom_prim, geom_type):
+        """Create a trimesh object from USD primitive parameters.
+
+        Args:
+            geom_prim: USD geometry primitive
+            geom_type: Type of the primitive (Sphere, Cube, Cylinder, Capsule, Cone)
+
+        Returns:
+            trimesh.Trimesh object or None if creation failed
+        """
+        try:
+            import trimesh
+
+            if geom_type == "Sphere":
+                # Get sphere parameters
+                sphere_geom = UsdGeom.Sphere(geom_prim)
+                radius_attr = sphere_geom.GetRadiusAttr()
+                radius = radius_attr.Get() if radius_attr else 1.0
+
+                # Create trimesh sphere
+                return trimesh.creation.uv_sphere(radius=radius)
+
+            elif geom_type == "Cube":
+                # Get cube parameters (size attribute)
+                cube_geom = UsdGeom.Cube(geom_prim)
+                size_attr = cube_geom.GetSizeAttr()
+                size = size_attr.Get() if size_attr else 2.0  # USD Cube default size is 2.0
+
+                # Create trimesh box
+                return trimesh.creation.box(extents=[size, size, size])
+
+            elif geom_type == "Cylinder":
+                # Get cylinder parameters
+                cylinder_geom = UsdGeom.Cylinder(geom_prim)
+                radius_attr = cylinder_geom.GetRadiusAttr()
+                height_attr = cylinder_geom.GetHeightAttr()
+                axis_attr = cylinder_geom.GetAxisAttr()
+
+                radius = radius_attr.Get() if radius_attr else 1.0
+                height = height_attr.Get() if height_attr else 2.0
+                axis = axis_attr.Get() if axis_attr else "Z"
+
+                # Create transform for axis alignment
+                transform = None
+                if axis == "X":
+                    transform = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+                elif axis == "Y":
+                    transform = trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+
+                # Create trimesh cylinder
+                return trimesh.creation.cylinder(radius=radius, height=height, transform=transform)
+
+            elif geom_type == "Capsule":
+                # Get capsule parameters
+                capsule_geom = UsdGeom.Capsule(geom_prim)
+                radius_attr = capsule_geom.GetRadiusAttr()
+                height_attr = capsule_geom.GetHeightAttr()
+                axis_attr = capsule_geom.GetAxisAttr()
+
+                radius = radius_attr.Get() if radius_attr else 1.0
+                height = height_attr.Get() if height_attr else 2.0
+                axis = axis_attr.Get() if axis_attr else "Z"
+
+                # Create transform for axis alignment
+                transform = None
+                if axis == "X":
+                    transform = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+                elif axis == "Y":
+                    transform = trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+
+                # Create trimesh capsule
+                return trimesh.creation.capsule(radius=radius, height=height, transform=transform)
+
+            elif geom_type == "Cone":
+                # Get cone parameters
+                cone_geom = UsdGeom.Cone(geom_prim)
+                radius_attr = cone_geom.GetRadiusAttr()
+                height_attr = cone_geom.GetHeightAttr()
+                axis_attr = cone_geom.GetAxisAttr()
+
+                radius = radius_attr.Get() if radius_attr else 1.0
+                height = height_attr.Get() if height_attr else 2.0
+                axis = axis_attr.Get() if axis_attr else "Z"
+
+                # Create transform for axis alignment
+                transform = None
+                if axis == "X":
+                    transform = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+                elif axis == "Y":
+                    transform = trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+
+                # Create trimesh cone
+                return trimesh.creation.cone(radius=radius, height=height, transform=transform)
+
+            else:
+                omni.log.warn(f"Unsupported primitive type for trimesh creation: {geom_type}")
+                return None
+
+        except Exception as e:
+            omni.log.warn(f"Failed to create trimesh for {geom_type}: {str(e)}")
+            return None
+
+    def _extract_mesh_data_from_prim(self, geom_prim):
+        """Extract mesh data from any supported USD geometry primitive.
+
+        Args:
+            geom_prim: USD geometry primitive (Mesh, Plane, Sphere, Cube, Cylinder, Capsule, Cone)
+
+        Returns:
+            tuple: (points, indices) as numpy arrays, or None if extraction failed
+        """
+        from pxr import UsdGeom
+
+        try:
+            geom_type = geom_prim.GetTypeName()
+
+            if geom_type == "Plane":
+                # Handle Plane using make_plane utility (keeps existing logic)
+                plane_mesh = make_plane(size=(2e6, 2e6), height=0.0, center_zero=True)
+
+                # Apply world transformation to plane
+                try:
+                    xform = UsdGeom.Xformable(geom_prim)
+                    if xform:
+                        transform_matrix = np.array(xform.ComputeLocalToWorldTransform(0.0)).T
+                    else:
+                        transform_matrix = np.eye(4)
+                except Exception:
+                    transform_matrix = np.eye(4)
+
+                points = np.matmul(plane_mesh.vertices, transform_matrix[:3, :3].T)
+                points += transform_matrix[:3, 3]
+                indices = plane_mesh.faces.flatten()
+
+                return points, indices
+
+            else:
+                # Handle all other geometry types (Mesh, Sphere, Cube, Cylinder, Capsule, Cone)
+
+                if geom_type == "Mesh":
+                    # Direct mesh access
+                    mesh_geom = UsdGeom.Mesh(geom_prim)
+                    points_attr = mesh_geom.GetPointsAttr()
+                    face_indices_attr = mesh_geom.GetFaceVertexIndicesAttr()
+                    face_counts_attr = mesh_geom.GetFaceVertexCountsAttr()
+
+                    if not (points_attr and face_indices_attr and face_counts_attr):
+                        omni.log.warn(f"Could not find mesh attributes for {geom_type}: {geom_prim.GetPath()}")
+                        return None
+
+                    # Get the actual data
+                    points_data = points_attr.Get()
+                    faces_data = face_indices_attr.Get()
+                    face_counts_data = face_counts_attr.Get()
+
+                    if points_data is None or faces_data is None or face_counts_data is None:
+                        omni.log.warn(f"Mesh attribute data is None for {geom_type}: {geom_prim.GetPath()}")
+                        return None
+
+                    points = list(points_data)
+                    points = [np.ravel(x) for x in points]
+                    points = np.array(points)
+
+                    if len(points) == 0:
+                        omni.log.warn(f"Empty points array for {geom_type}: {geom_prim.GetPath()}")
+                        return None
+
+                    faces = list(faces_data)
+                    face_counts = list(face_counts_data)
+
+                    if len(faces) == 0 or len(face_counts) == 0:
+                        omni.log.warn(f"Empty faces/face_counts for {geom_type}: {geom_prim.GetPath()}")
+                        return None
+
+                    # Check if triangulation is needed
+                    if not all(count == 3 for count in face_counts):
+                        omni.log.info(
+                            f"Triangulating {geom_type} {geom_prim.GetPath()} - found faces with"
+                            f" {set(face_counts)} vertices"
+                        )
+                        faces = self._triangulate_faces_from_list(faces, face_counts)
+
+                    # Convert to proper triangle format
+                    triangulated_indices = np.array(faces)
+
+                    # Apply world transformation
+                    try:
+                        xform = UsdGeom.Xformable(geom_prim)
+                        if xform:
+                            transform_matrix = np.array(xform.ComputeLocalToWorldTransform(0.0)).T
+                        else:
+                            transform_matrix = np.eye(4)
+                    except Exception:
+                        transform_matrix = np.eye(4)
+
+                    points = np.matmul(points, transform_matrix[:3, :3].T)
+                    points += transform_matrix[:3, 3]
+
+                    return points, triangulated_indices
+
+                else:
+                    # Handle primitive shapes (Sphere, Cube, Cylinder, Capsule, Cone) using trimesh
+                    trimesh_mesh = self._create_trimesh_from_usd_primitive(geom_prim, geom_type)
+
+                    if trimesh_mesh is None:
+                        omni.log.warn(f"Failed to create trimesh for {geom_type}: {geom_prim.GetPath()}")
+                        return None
+
+                    # Get scale from USD prim attribute
+                    try:
+                        path = geom_prim.GetPath().pathString
+                        prim = prim_utils.get_prim_at_path(path)
+                        scale_attr = prim.GetAttribute("xformOp:scale")
+                        if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                            scale = tuple(scale_attr.Get())
+                            # Apply scale to trimesh object if scale is not uniform [1,1,1]
+                            if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                                trimesh_mesh.apply_scale(scale)
+                    except Exception as e:
+                        omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+
+                    # Apply world transformation (rotation and translation)
+                    try:
+                        xform = UsdGeom.Xformable(geom_prim)
+                        if xform:
+                            transform_matrix = np.array(xform.ComputeLocalToWorldTransform(0.0)).T
+                        else:
+                            transform_matrix = np.eye(4)
+                    except Exception:
+                        transform_matrix = np.eye(4)
+
+                    # Transform mesh vertices to world coordinates
+                    points = np.matmul(trimesh_mesh.vertices, transform_matrix[:3, :3].T)
+                    points += transform_matrix[:3, 3]
+                    indices = trimesh_mesh.faces.flatten()
+
+                    return points, indices
+
+        except Exception as e:
+            omni.log.warn(f"Failed to extract mesh data from {geom_prim.GetTypeName()} {geom_prim.GetPath()}: {str(e)}")
+            return None
+
+    def _triangulate_faces_from_list(self, faces: list, face_counts: list) -> list:
+        """Convert polygonal faces to triangles using list format.
+
+        Args:
+            faces: Flattened list of face vertex indices
+            face_counts: List containing number of vertices per face
+
+        Returns:
+            Triangulated face indices as flat list
+        """
+        triangulated_faces = []
+        face_idx = 0
+
+        for count in face_counts:
+            if count == 3:
+                # Already a triangle
+                triangulated_faces.extend(faces[face_idx : face_idx + 3])
+            elif count == 4:
+                # Quad to two triangles
+                v0, v1, v2, v3 = faces[face_idx : face_idx + 4]
+                triangulated_faces.extend([v0, v1, v2])  # First triangle
+                triangulated_faces.extend([v0, v2, v3])  # Second triangle
+            else:
+                # General polygon triangulation (fan triangulation)
+                v0 = faces[face_idx]
+                for i in range(1, count - 1):
+                    v1 = faces[face_idx + i]
+                    v2 = faces[face_idx + i + 1]
+                    triangulated_faces.extend([v0, v1, v2])
+
+            face_idx += count
+
+        return triangulated_faces
+
+    def _extract_mesh_data_from_prim_dynamic(self, geom_prim):
+        """Extract mesh data from USD geometry primitive for dynamic tracking.
+
+        Args:
+            geom_prim: USD geometry primitive
+
+        Returns:
+            tuple: (points, indices) as numpy arrays in local coordinates, or None if extraction failed
+        """
+        try:
+            geom_type = geom_prim.GetTypeName()
+
+            if geom_type == "Plane":
+                # Create a simple plane in local coordinates
+                plane_mesh = make_plane(size=(2e6, 2e6), height=0.0, center_zero=True)
+
+                # Apply scale if present in the USD prim attribute
+                try:
+                    path = geom_prim.GetPath().pathString
+                    prim = prim_utils.get_prim_at_path(path)
+                    scale_attr = prim.GetAttribute("xformOp:scale")
+                    if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                        scale = tuple(scale_attr.Get())
+                        # Apply scale to plane vertices if scale is not uniform [1,1,1]
+                        if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                            vertices_scaled = plane_mesh.vertices * np.array(scale)
+                            return vertices_scaled, plane_mesh.faces.flatten()
+                except Exception as e:
+                    omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+
+                return plane_mesh.vertices, plane_mesh.faces.flatten()
+
+            elif geom_type == "Mesh":
+                # Direct mesh access
+                mesh_geom = UsdGeom.Mesh(geom_prim)
+                points_attr = mesh_geom.GetPointsAttr()
+                face_indices_attr = mesh_geom.GetFaceVertexIndicesAttr()
+                face_counts_attr = mesh_geom.GetFaceVertexCountsAttr()
+
+                if not (points_attr and face_indices_attr and face_counts_attr):
+                    return None
+
+                points_data = points_attr.Get()
+                faces_data = face_indices_attr.Get()
+                face_counts_data = face_counts_attr.Get()
+
+                if points_data is None or faces_data is None or face_counts_data is None:
+                    return None
+
+                points = np.array([[x[0], x[1], x[2]] for x in points_data])
+                faces = list(faces_data)
+                face_counts = list(face_counts_data)
+
+                if len(points) == 0 or len(faces) == 0:
+                    return None
+
+                # Triangulate if needed
+                if not all(count == 3 for count in face_counts):
+                    faces = self._triangulate_faces_from_list_dynamic(faces, face_counts)
+
+                # Apply scale if present in the USD prim attribute
+                try:
+                    path = geom_prim.GetPath().pathString
+                    prim = prim_utils.get_prim_at_path(path)
+                    scale_attr = prim.GetAttribute("xformOp:scale")
+                    if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                        scale = tuple(scale_attr.Get())
+                        # Apply scale to mesh vertices if scale is not uniform [1,1,1]
+                        if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                            points_scaled = points * np.array(scale)
+                            return points_scaled, np.array(faces)
+                except Exception as e:
+                    omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+
+                return points, np.array(faces)
+
+            else:
+                # Handle primitive shapes using trimesh in local coordinates with scale applied
+                trimesh_mesh = self._create_trimesh_from_usd_primitive_dynamic(geom_prim, geom_type)
+                if trimesh_mesh is not None:
+                    # Get scale from USD prim attribute
+                    try:
+                        path = geom_prim.GetPath().pathString
+                        prim = prim_utils.get_prim_at_path(path)
+                        scale_attr = prim.GetAttribute("xformOp:scale")
+                        if scale_attr and scale_attr.IsValid() and scale_attr.HasValue():
+                            scale = tuple(scale_attr.Get())
+                            # Apply scale to trimesh object if scale is not uniform [1,1,1]
+                            if not all(abs(s - 1.0) < 1e-6 for s in scale):
+                                trimesh_mesh.apply_scale(scale)
+                    except Exception as e:
+                        omni.log.warn(f"Could not get scale for {geom_prim.GetPath()}: {e}")
+
+                    return trimesh_mesh.vertices, trimesh_mesh.faces.flatten()
+
+        except Exception as e:
+            omni.log.warn(
+                f"Failed to extract dynamic mesh data from {geom_prim.GetTypeName()} {geom_prim.GetPath()}: {str(e)}"
+            )
+            return None
+
+    def _create_trimesh_from_usd_primitive_dynamic(self, geom_prim, geom_type):
+        """Create a trimesh object from USD primitive parameters in local coordinates.
+
+        Args:
+            geom_prim: USD geometry primitive
+            geom_type: Type of the primitive
+
+        Returns:
+            trimesh.Trimesh object or None if creation failed
+        """
+        try:
+            if geom_type == "Sphere":
+                sphere_geom = UsdGeom.Sphere(geom_prim)
+                radius_attr = sphere_geom.GetRadiusAttr()
+                radius = radius_attr.Get() if radius_attr else 1.0
+                return trimesh.creation.uv_sphere(radius=radius)
+
+            elif geom_type == "Cube":
+                cube_geom = UsdGeom.Cube(geom_prim)
+                size_attr = cube_geom.GetSizeAttr()
+                size = size_attr.Get() if size_attr else 2.0
+                return trimesh.creation.box(extents=[size, size, size])
+
+            elif geom_type == "Cylinder":
+                cylinder_geom = UsdGeom.Cylinder(geom_prim)
+                radius_attr = cylinder_geom.GetRadiusAttr()
+                height_attr = cylinder_geom.GetHeightAttr()
+                radius = radius_attr.Get() if radius_attr else 1.0
+                height = height_attr.Get() if height_attr else 2.0
+                return trimesh.creation.cylinder(radius=radius, height=height)
+
+            else:
+                return None
+
+        except Exception as e:
+            omni.log.warn(f"Failed to create dynamic trimesh for {geom_type}: {str(e)}")
+            return None
+
+    def _triangulate_faces_from_list_dynamic(self, faces: list, face_counts: list) -> list:
+        """Convert polygonal faces to triangles for dynamic meshes."""
+        triangulated_faces = []
+        face_idx = 0
+
+        for count in face_counts:
+            if count == 3:
+                triangulated_faces.extend(faces[face_idx : face_idx + 3])
+            elif count == 4:
+                v0, v1, v2, v3 = faces[face_idx : face_idx + 4]
+                triangulated_faces.extend([v0, v1, v2, v0, v2, v3])
+            else:
+                # Fan triangulation for polygons
+                for i in range(1, count - 1):
+                    triangulated_faces.extend([faces[face_idx], faces[face_idx + i], faces[face_idx + i + 1]])
+            face_idx += count
+
+        return triangulated_faces
+
+    def _make_prims_uninstanceable_for_discovery(self, prim_path: str) -> None:
+        """Make all prims under the given path uninstanceable to enable geometry discovery.
+
+        When parent prims have SetInstanceable(True), their children become instanced and
+        cannot be found by get_all_matching_child_prims(). This function recursively makes
+        all prims uninstanceable to allow proper geometry discovery.
+
+        Args:
+            prim_path: The root prim path to start making uninstanceable
+        """
+        try:
+            stage = stage_utils.get_current_stage()
+            root_prim = stage.GetPrimAtPath(prim_path)
+
+            if not root_prim or not root_prim.IsValid():
+                omni.log.warn(f"Invalid prim path for uninstanceable conversion: {prim_path}")
+                return
+
+            # Use USD traversal to find all instanced prims
+            prims_to_process = [root_prim]
+            made_uninstanceable_count = 0
+
+            while len(prims_to_process) > 0:
+                current_prim = prims_to_process.pop(0)
+
+                # Check if this prim is instanced and make it uninstanceable
+                if current_prim.IsInstance():
+                    current_prim.SetInstanceable(False)
+                    made_uninstanceable_count += 1
+                    omni.log.info(f"Made uninstanceable: {current_prim.GetPath().pathString}")
+
+                # Add all children to processing queue
+                children = current_prim.GetChildren()
+                prims_to_process.extend(children)
+
+            if made_uninstanceable_count > 0:
+                omni.log.info(f"Made {made_uninstanceable_count} prims uninstanceable under: {prim_path}")
+                # Force stage reload to ensure changes take effect
+                stage.Reload()
+
+        except Exception as e:
+            omni.log.warn(f"Error making prims uninstanceable for {prim_path}: {str(e)}")
+
+    def _update_combined_mesh_efficiently(self):
+        """Efficiently update the combined mesh using vectorized operations."""
+        if (
+            self.all_mesh_view is None
+            or self.combined_mesh is None
+            or self.mesh_instance_indices is None
+            or self.vertex_counts_per_instance is None
+            or self.all_base_points is None
+        ):
+            return
+
+        try:
+            # Get current world poses for all mesh instances
+            num_mesh_instances = len(self.mesh_instance_indices)
+            all_mesh_view = XFormPrim(self.all_mesh_prim_paths, reset_xform_properties=False)
+            current_poses, current_quats = all_mesh_view.get_world_poses(
+                torch.arange(num_mesh_instances, device=self.device)
+            )
+
+            # Convert to torch tensors if needed
+            if isinstance(current_poses, np.ndarray):
+                current_poses = torch.from_numpy(current_poses).to(device=self.device)
+            if isinstance(current_quats, np.ndarray):
+                current_quats = torch.from_numpy(current_quats).to(device=self.device)
+
+            # Expand current poses and quats to vertex level
+            expanded_positions = torch.repeat_interleave(current_poses, self.vertex_counts_per_instance.long(), dim=0)
+
+            expanded_quats = torch.repeat_interleave(current_quats, self.vertex_counts_per_instance.long(), dim=0)
+
+            # Apply world transform: quat_apply(mesh_quat, base_points) + mesh_pos
+            transformed_points = quat_apply(expanded_quats, self.all_base_points) + expanded_positions
+
+            # Update the warp mesh with the new transformed points
+            updated_points_wp = wp.from_torch(transformed_points, dtype=wp.vec3)
+            self.combined_mesh.points = updated_points_wp
+            self.combined_mesh.refit()
+
+        except Exception as e:
+            omni.log.warn(f"Failed to update combined mesh efficiently: {str(e)}")
