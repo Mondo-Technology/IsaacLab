@@ -280,7 +280,7 @@ class RayCaster(SensorBase):
             # only yaw orientation is considered and directions are not rotated
             ray_starts_w = quat_apply_yaw(quat_w.repeat(1, self.num_rays), self.ray_starts[env_ids])
             ray_starts_w += pos_w.unsqueeze(1)
-            ray_directions_w = self.ray_directions[env_ids]
+            ray_directions_w = quat_apply_yaw(quat_w.repeat(1, self.num_rays), self.ray_directions[env_ids])
         elif self.cfg.ray_alignment == "base":
             # apply horizontal drift to ray starting position in ray caster frame
             pos_w[:, 0:2] += quat_apply(quat_w, self.ray_cast_drift[env_ids])[:, 0:2]

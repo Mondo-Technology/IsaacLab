@@ -50,6 +50,18 @@ class TerrainGeneratorCfg:
     they are randomly generated.
     """
 
+    plane_cover: bool = False
+    """Whether to cover the mesh using the terrain. Defaults to False.
+
+    If True, the mesh is covered with the terrain. This is useful for generating terrains that are not flat.
+    """
+
+    mesh_offset: float = 0.0
+    """The offset of the mesh from the ground plane (in m). Defaults to 0.0.
+
+    This value is used to shift the mesh down to avoid z-fighting with the ground plane when `plane_cover` is True.
+    """
+
     size: tuple[float, float] = MISSING
     """The width (along x) and length (along y) of each sub-terrain (in m).
 

@@ -372,6 +372,9 @@ class EventManager(ManagerBase):
             if inspect.isclass(term_cfg.func) and term_cfg.mode == "prestartup":
                 omni.log.info(f"Initializing term '{term_name}' with class '{term_cfg.func.__name__}'.")
                 term_cfg.func = term_cfg.func(cfg=term_cfg, env=self._env)
+            elif inspect.isclass(term_cfg.func):
+                omni.log.info(f"Initializing term '{term_name}' with class  '{term_cfg.func.__name__}'.")
+                term_cfg.func = term_cfg.func(cfg=term_cfg, env=self._env)
 
             # check if mode is a new mode
             if term_cfg.mode not in self._mode_term_names:
