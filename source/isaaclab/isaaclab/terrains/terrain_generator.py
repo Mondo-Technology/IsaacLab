@@ -107,6 +107,13 @@ class TerrainGenerator:
         self.cfg = cfg
         self.device = device
 
+        # === GT grids (added) ===
+        self.sub_terrain_names_order: list[str] = list(self.cfg.sub_terrains.keys())
+        self.name_grid_true: np.ndarray = np.empty((self.cfg.num_rows, self.cfg.num_cols), dtype=object)
+        self.difficulty_grid_true: np.ndarray = np.zeros((self.cfg.num_rows, self.cfg.num_cols), dtype=float)
+        self.type_index_grid_true: np.ndarray = np.zeros((self.cfg.num_rows, self.cfg.num_cols), dtype=np.int32)
+        # ========================
+
         # set common values to all sub-terrains config
         for sub_cfg in self.cfg.sub_terrains.values():
             # size of all terrains
@@ -195,63 +202,182 @@ class TerrainGenerator:
 
         return msg
 
+    # === Utilities (added) ===
+    def world_xy_to_rc(self, xy: np.ndarray | torch.Tensor) -> tuple[int, int]:
+        """Map a world XY position back to (row, col) indices of the sub-terrain grid.
+
+        This uses the same centering transform applied in __init__ (negative half-extent),
+        so it is robust as long as you pass positions in world coordinates.
+
+        Args:
+            xy: (2,) array/tensor of [x, y] in world coordinates.
+
+        Returns:
+            (row, col): integers clamped to valid ranges.
+        """
+        if isinstance(xy, torch.Tensor):
+            x = float(xy[0].item())
+            y = float(xy[1].item())
+        else:
+            x = float(xy[0])
+            y = float(xy[1])
+
+        # undo the centering offset is already reflected in terrain_origins; we directly compute by size
+        # row grows along X, col grows along Y (consistent with _add_sub_terrain)
+        cell_x = x + (self.cfg.num_rows * self.cfg.size[0]) * 0.5
+        cell_y = y + (self.cfg.num_cols * self.cfg.size[1]) * 0.5
+
+        r = int(np.floor(cell_x / self.cfg.size[0]))
+        c = int(np.floor(cell_y / self.cfg.size[1]))
+
+        r = max(0, min(self.cfg.num_rows - 1, r))
+        c = max(0, min(self.cfg.num_cols - 1, c))
+        return r, c
+
+    def export_semantic_name_grid(self, mapping: dict[str, str] | None = None) -> np.ndarray:
+        """Return an (R,C) grid of semantic names derived from true sub-terrain names.
+
+        Args:
+            mapping: Optional mapping canonical_name -> semantic_name, e.g.
+                     {"pyramid_stairs": "stairs", "inverted_pyramid_stairs": "stairs",
+                      "pyramid_sloped": "slope", "flat": "flat", ...}
+
+        Returns:
+            np.ndarray of dtype=object with semantic names.
+        """
+        R, C = self.cfg.num_rows, self.cfg.num_cols
+        out = np.empty((R, C), dtype=object)
+        if mapping is None:
+            # default: identity
+            for r in range(R):
+                for c in range(C):
+                    out[r, c] = str(self.name_grid_true[r, c])
+            return out
+
+        for r in range(R):
+            for c in range(C):
+                key = str(self.name_grid_true[r, c]).lower().strip()
+                out[r, c] = mapping.get(key, "unknown")
+        return out
+
+
     """
     Terrain generator functions.
     """
 
+    # def _generate_random_terrains(self):
+    #     """Add terrains based on randomly sampled difficulty parameter."""
+    #     # normalize the proportions of the sub-terrains
+    #     proportions = np.array([sub_cfg.proportion for sub_cfg in self.cfg.sub_terrains.values()])
+    #     proportions /= np.sum(proportions)
+    #     # create a list of all terrain configs
+    #     sub_terrains_cfgs = list(self.cfg.sub_terrains.values())
+
+    #     # randomly sample sub-terrains
+    #     for index in range(self.cfg.num_rows * self.cfg.num_cols):
+    #         # coordinate index of the sub-terrain
+    #         (sub_row, sub_col) = np.unravel_index(index, (self.cfg.num_rows, self.cfg.num_cols))
+    #         # randomly sample terrain index
+    #         sub_index = self.np_rng.choice(len(proportions), p=proportions)
+    #         # randomly sample difficulty parameter
+    #         difficulty = self.np_rng.uniform(*self.cfg.difficulty_range)
+    #         # generate terrain
+    #         mesh, origin = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[sub_index])
+    #         # add to sub-terrains
+    #         self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_index])
+
     def _generate_random_terrains(self):
         """Add terrains based on randomly sampled difficulty parameter."""
-        # normalize the proportions of the sub-terrains
         proportions = np.array([sub_cfg.proportion for sub_cfg in self.cfg.sub_terrains.values()])
         proportions /= np.sum(proportions)
-        # create a list of all terrain configs
         sub_terrains_cfgs = list(self.cfg.sub_terrains.values())
+        sub_names = self.sub_terrain_names_order  # <- added
 
-        # randomly sample sub-terrains
         for index in range(self.cfg.num_rows * self.cfg.num_cols):
-            # coordinate index of the sub-terrain
-            (sub_row, sub_col) = np.unravel_index(index, (self.cfg.num_rows, self.cfg.num_cols))
-            # randomly sample terrain index
-            sub_index = self.np_rng.choice(len(proportions), p=proportions)
-            # randomly sample difficulty parameter
-            difficulty = self.np_rng.uniform(*self.cfg.difficulty_range)
-            # generate terrain
+            sub_row, sub_col = np.unravel_index(index, (self.cfg.num_rows, self.cfg.num_cols))
+            sub_index = int(self.np_rng.choice(len(proportions), p=proportions))
+            difficulty = float(self.np_rng.uniform(*self.cfg.difficulty_range))
+
             mesh, origin = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[sub_index])
-            # add to sub-terrains
-            self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_index])
+
+            # 记录 GT（added）
+            self.name_grid_true[sub_row, sub_col] = sub_names[sub_index]
+            self.type_index_grid_true[sub_row, sub_col] = sub_index
+            self.difficulty_grid_true[sub_row, sub_col] = difficulty
+
+            # 传入 name / index / difficulty（签名已扩展）
+            self._add_sub_terrain(
+                mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_index],
+                sub_name=sub_names[sub_index], sub_index=sub_index, difficulty=difficulty
+            )
+
+    # def _generate_curriculum_terrains(self):
+    #     """Add terrains based on the difficulty parameter."""
+    #     # normalize the proportions of the sub-terrains
+    #     proportions = np.array([sub_cfg.proportion for sub_cfg in self.cfg.sub_terrains.values()])
+    #     proportions /= np.sum(proportions)
+
+    #     # find the sub-terrain index for each column
+    #     # we generate the terrains based on their proportion (not randomly sampled)
+    #     sub_indices = []
+    #     for index in range(self.cfg.num_cols):
+    #         sub_index = np.min(np.where(index / self.cfg.num_cols + 0.001 < np.cumsum(proportions))[0])
+    #         sub_indices.append(sub_index)
+    #     sub_indices = np.array(sub_indices, dtype=np.int32)
+    #     # create a list of all terrain configs
+    #     sub_terrains_cfgs = list(self.cfg.sub_terrains.values())
+
+    #     # curriculum-based sub-terrains
+    #     for sub_col in range(self.cfg.num_cols):
+    #         for sub_row in range(self.cfg.num_rows):
+    #             # vary the difficulty parameter linearly over the number of rows
+    #             # note: based on the proportion, multiple columns can have the same sub-terrain type.
+    #             #  Thus to increase the diversity along the rows, we add a small random value to the difficulty.
+    #             #  This ensures that the terrains are not exactly the same. For example, if the
+    #             #  the row index is 2 and the number of rows is 10, the nominal difficulty is 0.2.
+    #             #  We add a small random value to the difficulty to make it between 0.2 and 0.3.
+    #             lower, upper = self.cfg.difficulty_range
+    #             difficulty = (sub_row + self.np_rng.uniform()) / self.cfg.num_rows
+    #             difficulty = lower + (upper - lower) * difficulty
+    #             # generate terrain
+    #             mesh, origin = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[sub_indices[sub_col]])
+    #             # add to sub-terrains
+    #             self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_indices[sub_col]])
 
     def _generate_curriculum_terrains(self):
         """Add terrains based on the difficulty parameter."""
-        # normalize the proportions of the sub-terrains
         proportions = np.array([sub_cfg.proportion for sub_cfg in self.cfg.sub_terrains.values()])
         proportions /= np.sum(proportions)
 
-        # find the sub-terrain index for each column
-        # we generate the terrains based on their proportion (not randomly sampled)
         sub_indices = []
         for index in range(self.cfg.num_cols):
             sub_index = np.min(np.where(index / self.cfg.num_cols + 0.001 < np.cumsum(proportions))[0])
-            sub_indices.append(sub_index)
-        sub_indices = np.array(sub_indices, dtype=np.int32)
-        # create a list of all terrain configs
-        sub_terrains_cfgs = list(self.cfg.sub_terrains.values())
+            sub_indices.append(int(sub_index))
+        sub_indices = np.asarray(sub_indices, dtype=np.int32)
 
-        # curriculum-based sub-terrains
+        sub_terrains_cfgs = list(self.cfg.sub_terrains.values())
+        sub_names = self.sub_terrain_names_order  # <- added
+        lower, upper = self.cfg.difficulty_range
+
         for sub_col in range(self.cfg.num_cols):
+            which = int(sub_indices[sub_col])
             for sub_row in range(self.cfg.num_rows):
-                # vary the difficulty parameter linearly over the number of rows
-                # note: based on the proportion, multiple columns can have the same sub-terrain type.
-                #  Thus to increase the diversity along the rows, we add a small random value to the difficulty.
-                #  This ensures that the terrains are not exactly the same. For example, if the
-                #  the row index is 2 and the number of rows is 10, the nominal difficulty is 0.2.
-                #  We add a small random value to the difficulty to make it between 0.2 and 0.3.
-                lower, upper = self.cfg.difficulty_range
-                difficulty = (sub_row + self.np_rng.uniform()) / self.cfg.num_rows
-                difficulty = lower + (upper - lower) * difficulty
-                # generate terrain
-                mesh, origin = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[sub_indices[sub_col]])
-                # add to sub-terrains
-                self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_indices[sub_col]])
+                # 线性+扰动的课程难度
+                difficulty = (sub_row + float(self.np_rng.uniform())) / float(self.cfg.num_rows)
+                difficulty = float(lower + (upper - lower) * difficulty)
+
+                mesh, origin = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[which])
+
+                # 记录 GT（added）
+                self.name_grid_true[sub_row, sub_col] = sub_names[which]
+                self.type_index_grid_true[sub_row, sub_col] = which
+                self.difficulty_grid_true[sub_row, sub_col] = difficulty
+
+                # 传入 name / index / difficulty（签名已扩展）
+                self._add_sub_terrain(
+                    mesh, origin, sub_row, sub_col, sub_terrains_cfgs[which],
+                    sub_name=sub_names[which], sub_index=which, difficulty=difficulty
+                )
 
     """
     Internal helper functions.
@@ -279,34 +405,77 @@ class TerrainGenerator:
         # add the border to the list of meshes
         self.terrain_meshes.append(border)
 
+    # def _add_sub_terrain(
+    #     self, mesh: trimesh.Trimesh, origin: np.ndarray, row: int, col: int, sub_terrain_cfg: SubTerrainBaseCfg
+    # ):
+    #     """Add input sub-terrain to the list of sub-terrains.
+
+    #     This function adds the input sub-terrain mesh to the list of sub-terrains and updates the origin
+    #     of the sub-terrain in the list of origins. It also samples flat patches if specified.
+
+    #     Args:
+    #         mesh: The mesh of the sub-terrain.
+    #         origin: The origin of the sub-terrain.
+    #         row: The row index of the sub-terrain.
+    #         col: The column index of the sub-terrain.
+    #     """
+    #     # sample flat patches if specified
+    #     if sub_terrain_cfg.flat_patch_sampling is not None:
+    #         omni.log.info(f"Sampling flat patches for sub-terrain at (row, col):  ({row}, {col})")
+    #         # convert the mesh to warp mesh
+    #         wp_mesh = convert_to_warp_mesh(mesh.vertices, mesh.faces, device=self.device)
+    #         # sample flat patches based on each patch configuration for that sub-terrain
+    #         for name, patch_cfg in sub_terrain_cfg.flat_patch_sampling.items():
+    #             patch_cfg: FlatPatchSamplingCfg
+    #             # create the flat patches tensor (if not already created)
+    #             if name not in self.flat_patches:
+    #                 self.flat_patches[name] = torch.zeros(
+    #                     (self.cfg.num_rows, self.cfg.num_cols, patch_cfg.num_patches, 3), device=self.device
+    #                 )
+    #             # add the flat patches to the tensor
+    #             self.flat_patches[name][row, col] = find_flat_patches(
+    #                 wp_mesh=wp_mesh,
+    #                 origin=origin,
+    #                 num_patches=patch_cfg.num_patches,
+    #                 patch_radius=patch_cfg.patch_radius,
+    #                 x_range=patch_cfg.x_range,
+    #                 y_range=patch_cfg.y_range,
+    #                 z_range=patch_cfg.z_range,
+    #                 max_height_diff=patch_cfg.max_height_diff,
+    #             )
+
+    #     # transform the mesh to the correct position
+    #     transform = np.eye(4)
+    #     transform[0:2, -1] = (row + 0.5) * self.cfg.size[0], (col + 0.5) * self.cfg.size[1]
+    #     mesh.apply_transform(transform)
+    #     # add mesh to the list
+    #     self.terrain_meshes.append(mesh)
+    #     # add origin to the list
+    #     self.terrain_origins[row, col] = origin + transform[:3, -1]
+
     def _add_sub_terrain(
-        self, mesh: trimesh.Trimesh, origin: np.ndarray, row: int, col: int, sub_terrain_cfg: SubTerrainBaseCfg
+        self,
+        mesh: trimesh.Trimesh,
+        origin: np.ndarray,
+        row: int,
+        col: int,
+        sub_terrain_cfg: SubTerrainBaseCfg,
+        *,
+        sub_name: str | None = None,      # <- added (optional)
+        sub_index: int | None = None,     # <- added (optional)
+        difficulty: float | None = None,  # <- added (optional)
     ):
-        """Add input sub-terrain to the list of sub-terrains.
-
-        This function adds the input sub-terrain mesh to the list of sub-terrains and updates the origin
-        of the sub-terrain in the list of origins. It also samples flat patches if specified.
-
-        Args:
-            mesh: The mesh of the sub-terrain.
-            origin: The origin of the sub-terrain.
-            row: The row index of the sub-terrain.
-            col: The column index of the sub-terrain.
-        """
-        # sample flat patches if specified
+        """Add input sub-terrain to the list of sub-terrains and update origins / patches."""
+        # sample flat patches if specified (原逻辑不变)
         if sub_terrain_cfg.flat_patch_sampling is not None:
             omni.log.info(f"Sampling flat patches for sub-terrain at (row, col):  ({row}, {col})")
-            # convert the mesh to warp mesh
             wp_mesh = convert_to_warp_mesh(mesh.vertices, mesh.faces, device=self.device)
-            # sample flat patches based on each patch configuration for that sub-terrain
             for name, patch_cfg in sub_terrain_cfg.flat_patch_sampling.items():
                 patch_cfg: FlatPatchSamplingCfg
-                # create the flat patches tensor (if not already created)
                 if name not in self.flat_patches:
                     self.flat_patches[name] = torch.zeros(
                         (self.cfg.num_rows, self.cfg.num_cols, patch_cfg.num_patches, 3), device=self.device
                     )
-                # add the flat patches to the tensor
                 self.flat_patches[name][row, col] = find_flat_patches(
                     wp_mesh=wp_mesh,
                     origin=origin,
@@ -318,14 +487,18 @@ class TerrainGenerator:
                     max_height_diff=patch_cfg.max_height_diff,
                 )
 
-        # transform the mesh to the correct position
+        # transform the mesh to the correct position (原逻辑不变)
         transform = np.eye(4)
         transform[0:2, -1] = (row + 0.5) * self.cfg.size[0], (col + 0.5) * self.cfg.size[1]
         mesh.apply_transform(transform)
-        # add mesh to the list
         self.terrain_meshes.append(mesh)
-        # add origin to the list
         self.terrain_origins[row, col] = origin + transform[:3, -1]
+
+        # （可选）这里也可再次写 GT，但上游已写，这里就不重复赋值了：
+        # if sub_name is not None: self.name_grid_true[row, col] = sub_name
+        # if sub_index is not None: self.type_index_grid_true[row, col] = int(sub_index)
+        # if difficulty is not None: self.difficulty_grid_true[row, col] = float(difficulty)
+
 
     def _get_terrain_mesh(self, difficulty: float, cfg: SubTerrainBaseCfg) -> tuple[trimesh.Trimesh, np.ndarray]:
         """Generate a sub-terrain mesh based on the input difficulty parameter.

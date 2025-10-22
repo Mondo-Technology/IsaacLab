@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 import trimesh
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import omni.log
 
@@ -53,6 +53,13 @@ class TerrainImporter:
     env_origins: torch.Tensor
     """The origins of the environments. Shape is (num_envs, 3)."""
 
+    # --- NEW: keep a reference to generator for GT access
+    generator: Optional[TerrainGenerator] = None
+    _generator: Optional[TerrainGenerator] = None
+    # --- optional caches for quick access / serialization
+    name_grid_true: Optional[np.ndarray] = None
+    difficulty_grid_true: Optional[np.ndarray] = None
+
     def __init__(self, cfg: TerrainImporterCfg):
         """Initialize the terrain importer.
 
@@ -90,6 +97,20 @@ class TerrainImporter:
             self.configure_env_origins(terrain_generator.terrain_origins)
             # refer to the flat patches
             self._terrain_flat_patches = terrain_generator.flat_patches
+
+            # ------------------------------------------------------------------
+            # NEW: expose generator & GT grids so higher layers can read them.
+            # ------------------------------------------------------------------
+            self.generator = terrain_generator
+            self._generator = terrain_generator  # keep alias for compatibility
+
+            # (optional) copy GT grids onto importer for quick access/serialization
+            if hasattr(terrain_generator, "name_grid_true"):
+                self.name_grid_true = terrain_generator.name_grid_true
+            if hasattr(terrain_generator, "difficulty_grid_true"):
+                self.difficulty_grid_true = terrain_generator.difficulty_grid_true
+            # ------------------------------------------------------------------
+
         elif self.cfg.terrain_type == "usd":
             # check if config is provided
             if self.cfg.usd_path is None:
@@ -136,6 +157,25 @@ class TerrainImporter:
     def terrain_names(self) -> list[str]:
         """A list of names of the imported terrains."""
         return [f"'{path.split('/')[-1]}'" for path in self.terrain_prim_paths]
+
+    # --- NEW: safe getters for GT grids (work for all terrain types) ---
+    @property
+    def gt_name_grid(self) -> Optional[np.ndarray]:
+        """Return GT name grid if available (generator-backed terrains)."""
+        if self.name_grid_true is not None:
+            return self.name_grid_true
+        if self.generator is not None and hasattr(self.generator, "name_grid_true"):
+            return self.generator.name_grid_true  # type: ignore[attr-defined]
+        return None
+
+    @property
+    def gt_difficulty_grid(self) -> Optional[np.ndarray]:
+        """Return GT difficulty grid if available (generator-backed terrains)."""
+        if self.difficulty_grid_true is not None:
+            return self.difficulty_grid_true
+        if self.generator is not None and hasattr(self.generator, "difficulty_grid_true"):
+            return self.generator.difficulty_grid_true  # type: ignore[attr-defined]
+        return None
 
     """
     Operations - Visibility.
